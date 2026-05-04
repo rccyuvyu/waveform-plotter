@@ -1,0 +1,97 @@
+{
+  "name": "waveform-plotter-vscode",
+  "displayName": "Waveform Plotter",
+  "description": "Variable streaming plotter for embedded debug sessions: passive watch, live telnet, RTT and FFT.",
+  "version": "1.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Visualization"
+  ],
+  "activationEvents": [
+    "onView:waveformPlotter.view",
+    "onCommand:waveformPlotter.addSelection",
+    "onCommand:waveformPlotter.focus",
+    "onCommand:waveformPlotter.open"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "waveformPlotter",
+          "title": "Waveform",
+          "icon": "media/waveform.svg"
+        }
+      ]
+    },
+    "views": {
+      "waveformPlotter": [
+        {
+          "id": "waveformPlotter.view",
+          "name": "Waveform Plotter",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "waveformPlotter.addSelection",
+        "title": "Add to Waveform Plotter"
+      },
+      {
+        "command": "waveformPlotter.focus",
+        "title": "Focus Waveform Plotter"
+      },
+      {
+        "command": "waveformPlotter.open",
+        "title": "Open Waveform Plotter"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "waveformPlotter.addSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Waveform Plotter",
+      "properties": {
+        "waveformPlotter.telnetPort": {
+          "type": "number",
+          "default": 4444,
+          "description": "OpenOCD telnet port."
+        },
+        "waveformPlotter.rttPort": {
+          "type": "number",
+          "default": 9090,
+          "description": "RTT server TCP port."
+        },
+        "waveformPlotter.maxChannels": {
+          "type": "number",
+          "default": 8,
+          "description": "Maximum plotted channels."
+        },
+        "waveformPlotter.bufferSize": {
+          "type": "number",
+          "default": 10000,
+          "description": "Samples per channel buffer size."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}
