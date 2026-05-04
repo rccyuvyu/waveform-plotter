@@ -54,6 +54,7 @@ class WaveformController {
         this.autoLoadedSessions = new Set();
         this.lastPushedDataVersion = -1;
         this.lastPushedChannelSignature = '';
+        this.lastPushedTotalSamples = 0;
         this.dataBuffer = new dataBuffer_1.DataBuffer(vscode.workspace.getConfiguration('waveformPlotter').get('maxChannels', 8), vscode.workspace.getConfiguration('waveformPlotter').get('bufferSize', 10000));
         this.passiveCollector = new passiveCollector_1.PassiveCollector(this.dataBuffer);
         this.liveWatchService = new liveWatchService_1.LiveWatchService(this.dataBuffer, () => this.scheduleSync());
@@ -190,13 +191,13 @@ class WaveformController {
             rttPort: clampInt(update.rttPort ?? this.state.rttPort, 1, 65535, 9090),
             fontSize: clampInt(update.fontSize ?? this.state.fontSize, 8, 20, 12),
             lineWidth: clamp(update.lineWidth ?? this.state.lineWidth, 0.5, 5, 2),
-            refreshFps: update.refreshFps === 60 ? 60 : 30
+            refreshFps: normalizeRefreshFps(update.refreshFps ?? this.state.refreshFps)
         };
         this.persist();
         this.scheduleSync(true);
     }
     async setFrequency(hz) {
-        this.state.liveWatchFrequency = clampInt(hz, 1, 2000, 50);
+        this.state.liveWatchFrequency = clampInt(hz, 1, 10000, 50);
         this.persist();
         this.scheduleSync(true);
     }
@@ -268,13 +269,16 @@ class WaveformController {
                     rttAutoInit: Boolean(message.rttAutoInit),
                     fontSize: Number(message.fontSize) || this.state.fontSize,
                     lineWidth: Number(message.lineWidth) || this.state.lineWidth,
-                    refreshFps: Number(message.refreshFps) === 60 ? 60 : 30
+                    refreshFps: normalizeRefreshFps(Number(message.refreshFps))
                 });
                 return;
             case 'openSettings':
                 this.scheduleSync(true);
                 return;
             case 'refresh':
+                this.lastPushedDataVersion = -1;
+                this.lastPushedChannelSignature = '';
+                this.lastPushedTotalSamples = 0;
                 this.scheduleSync(true);
                 return;
             default:
@@ -568,12 +572,15 @@ class WaveformController {
         void this.context.workspaceState.update(this.stateKey, this.state);
     }
     scheduleSync(immediate = false) {
-        if (this.syncTimer) {
-            clearTimeout(this.syncTimer);
-            this.syncTimer = undefined;
-        }
         if (immediate) {
+            if (this.syncTimer) {
+                clearTimeout(this.syncTimer);
+                this.syncTimer = undefined;
+            }
             void this.pushState();
+            return;
+        }
+        if (this.syncTimer) {
             return;
         }
         this.syncTimer = setTimeout(() => {
@@ -584,13 +591,31 @@ class WaveformController {
     async pushState() {
         const channels = this.dataBuffer.getChannels();
         const channelSignature = channels.map((c) => c.name).join('\u0001');
-        const includeData = this.dataBuffer.version !== this.lastPushedDataVersion ||
-            channelSignature !== this.lastPushedChannelSignature;
+        const dataVersionChanged = this.dataBuffer.version !== this.lastPushedDataVersion;
+        const structureChanged = channelSignature !== this.lastPushedChannelSignature;
+        const canAppend = this.viewProvider.hasView() &&
+            dataVersionChanged &&
+            !structureChanged &&
+            this.dataBuffer.tsSize > 0;
+        if (canAppend) {
+            const append = this.buildAppendState();
+            if (append && append.timestampsSec.length > 0) {
+                const viewState = this.buildViewState(channels, false);
+                this.viewProvider.postState(viewState);
+                this.viewProvider.postAppend(append);
+                this.lastPushedDataVersion = this.dataBuffer.version;
+                this.lastPushedChannelSignature = channelSignature;
+                this.lastPushedTotalSamples = append.totalSamples;
+                return;
+            }
+        }
+        const includeData = dataVersionChanged || structureChanged;
         const viewState = this.buildViewState(channels, includeData);
         this.viewProvider.postState(viewState);
         if (includeData) {
             this.lastPushedDataVersion = this.dataBuffer.version;
             this.lastPushedChannelSignature = channelSignature;
+            this.lastPushedTotalSamples = this.dataBuffer.totalSamples;
         }
     }
     buildViewState(channels, includeData) {
@@ -609,6 +634,7 @@ class WaveformController {
             ? this.rttService.isRunning.value
             : this.liveWatchService.isRunning.value;
         return {
+            bufferCapacity: this.dataBuffer.capacity,
             variables,
             data: includeData ? this.dataBuffer.snapshot() : undefined,
             status: this.buildStatusText(),
@@ -632,6 +658,13 @@ class WaveformController {
             }
         };
     }
+    buildAppendState() {
+        const append = this.dataBuffer.appendSnapshotSince(this.lastPushedTotalSamples);
+        if (!append) {
+            return undefined;
+        }
+        return append;
+    }
     buildStatusText() {
         const channels = this.dataBuffer.getChannels();
         if (!channels.length) {
@@ -645,7 +678,9 @@ class WaveformController {
             if (!this.rttService.isRunning.value) {
                 return '';
             }
-            return this.rttService.lastError ? `RTT: error` : `RTT: tcp:${this.state.rttPort} (${this.rttService.sampleCount})`;
+            return this.rttService.lastError
+                ? 'RTT: error'
+                : `RTT: tcp:${this.state.rttPort} (${this.rttService.sampleCount})`;
         }
         if (!this.liveWatchService.isRunning.value) {
             return '';
@@ -698,5 +733,14 @@ function clamp(v, min, max, fallback) {
 }
 function clampInt(v, min, max, fallback) {
     return Math.round(clamp(v, min, max, fallback));
+}
+function normalizeRefreshFps(v) {
+    if (v >= 120) {
+        return 120;
+    }
+    if (v >= 60) {
+        return 60;
+    }
+    return 30;
 }
 //# sourceMappingURL=controller.js.map

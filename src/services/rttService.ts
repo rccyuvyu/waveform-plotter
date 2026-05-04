@@ -1,12 +1,14 @@
 import net from 'net';
 import { DataBuffer } from '../core/dataBuffer';
 import { TelnetClient } from './telnetClient';
+import { SampleRateMeter } from './sampleRateMeter';
 
 export class RttService {
   readonly isRunning = { value: false };
   sampleCount = 0;
   lastError: string | undefined;
   lastFoundRegion: [string, string] | undefined;
+  private readonly sampleRateMeter = new SampleRateMeter();
 
   private socket: net.Socket | undefined;
   private readerBuffer = '';
@@ -99,6 +101,7 @@ export class RttService {
     this.lastError = undefined;
     this.readerBuffer = '';
     this.lastCallbackNs = 0n;
+    this.sampleRateMeter.reset();
 
     try {
       const socket = net.createConnection({ host, port });
@@ -139,6 +142,7 @@ export class RttService {
 
   async stopRtt(): Promise<void> {
     this.isRunning.value = false;
+    this.sampleRateMeter.reset();
     const s = this.socket;
     this.socket = undefined;
     this.readerBuffer = '';
@@ -207,14 +211,19 @@ export class RttService {
       }
     }
 
-    this.dataBuffer.pushAll(values, process.hrtime.bigint());
-    this.sampleCount += 1;
-
     const now = process.hrtime.bigint();
+    this.dataBuffer.pushAll(values, now);
+    this.sampleCount += 1;
+    this.sampleRateMeter.mark(now);
+
     if (now - this.lastCallbackNs >= 16_000_000n) {
       this.lastCallbackNs = now;
       this.onData();
     }
+  }
+
+  getActualFrequencyHz(): number {
+    return this.sampleRateMeter.getHz();
   }
 }
 

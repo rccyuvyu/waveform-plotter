@@ -37,6 +37,7 @@
   };
 
   const state = {
+    bufferCapacity: 10000,
     data: { channels: [], timestampsSec: [], version: 0 },
     variables: [],
     status: '',
@@ -50,7 +51,7 @@
     timeUnit: 'ms',
     fontSize: 12,
     lineWidth: 2,
-    refreshFps: 30,
+    refreshFps: 60,
     settings: {
       telnetPort: 4444,
       rttPort: 9090,
@@ -101,6 +102,10 @@
 
   window.addEventListener('message', (event) => {
     const msg = event.data;
+    if (msg?.type === 'append') {
+      applyAppend(msg.append);
+      return;
+    }
     if (msg?.type !== 'state') {
       return;
     }
@@ -141,7 +146,7 @@
     ui.liveBtn.addEventListener('click', () => vscode.postMessage({ type: 'toggleLive' }));
     ui.sourceSel.addEventListener('change', () => vscode.postMessage({ type: 'dataSource', source: ui.sourceSel.value }));
     ui.freqInput.addEventListener('change', () => {
-      const freq = clampInt(ui.freqInput.value, 1, 2000, 50);
+      const freq = clampInt(ui.freqInput.value, 1, 10000, 50);
       vscode.postMessage({ type: 'setFrequency', frequencyHz: freq });
     });
     ui.addBtn.addEventListener('click', addVarFromInput);
@@ -166,7 +171,7 @@
         rttAutoInit: ui.autoInit.checked,
         fontSize: clampInt(ui.fontSize.value, 8, 20, 12),
         lineWidth: clampFloat(ui.lineWidth.value, 0.5, 5, 2),
-        refreshFps: ui.refreshFps.value === '60' ? 60 : 30
+        refreshFps: clampInt(ui.refreshFps.value, 30, 120, 60)
       };
       vscode.postMessage(payload);
     });
@@ -296,7 +301,7 @@
   }
 
   function renderLoop(ts) {
-    const interval = state.refreshFps >= 60 ? 16 : 33;
+    const interval = 1000 / Math.max(1, state.refreshFps || 60);
     if (ts - view.lastRenderMs >= interval) {
       view.lastRenderMs = ts;
       draw();
@@ -758,7 +763,40 @@
     ui.autoInit.checked = !!state.settings.rttAutoInit;
     ui.fontSize.value = String(state.fontSize);
     ui.lineWidth.value = String(state.lineWidth);
-    ui.refreshFps.value = state.refreshFps === 60 ? '60' : '30';
+    ui.refreshFps.value = String(state.refreshFps >= 120 ? 120 : state.refreshFps >= 60 ? 60 : 30);
+  }
+
+  function applyAppend(append) {
+    if (!append || !Array.isArray(append.timestampsSec) || !state.data) {
+      return;
+    }
+    if (!Array.isArray(state.data.timestampsSec)) {
+      state.data.timestampsSec = [];
+    }
+
+    state.data.timestampsSec.push(...append.timestampsSec);
+    const appendMap = new Map((append.channels || []).map((ch) => [ch.name, ch.data || []]));
+    for (const channel of state.data.channels) {
+      const incoming = appendMap.get(channel.name);
+      if (incoming && incoming.length) {
+        channel.data.push(...incoming);
+      }
+    }
+
+    trimBufferedData();
+    state.data.version = state.data.version + append.timestampsSec.length;
+    renderControls();
+  }
+
+  function trimBufferedData() {
+    const overflow = Math.max(0, state.data.timestampsSec.length - state.bufferCapacity);
+    if (overflow <= 0) {
+      return;
+    }
+    state.data.timestampsSec.splice(0, overflow);
+    for (const channel of state.data.channels) {
+      channel.data.splice(0, overflow);
+    }
   }
 
   function addVarFromInput() {

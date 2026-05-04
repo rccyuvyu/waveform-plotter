@@ -7,7 +7,7 @@ import { LiveWatchService } from './services/liveWatchService';
 import { PassiveCollector } from './services/passiveCollector';
 import { RttService } from './services/rttService';
 import { OpenOcdPortDetector } from './services/openocdPortDetector';
-import { WaveformViewProvider, WaveformViewState } from './ui/panel';
+import { WaveformAppendState, WaveformViewProvider, WaveformViewState } from './ui/panel';
 
 export class WaveformController implements vscode.Disposable {
   private readonly stateKey = 'waveformPlotter.state';
@@ -24,6 +24,7 @@ export class WaveformController implements vscode.Disposable {
   private autoLoadedSessions = new Set<string>();
   private lastPushedDataVersion = -1;
   private lastPushedChannelSignature = '';
+  private lastPushedTotalSamples = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -185,14 +186,14 @@ export class WaveformController implements vscode.Disposable {
       rttPort: clampInt(update.rttPort ?? this.state.rttPort, 1, 65535, 9090),
       fontSize: clampInt(update.fontSize ?? this.state.fontSize, 8, 20, 12),
       lineWidth: clamp(update.lineWidth ?? this.state.lineWidth, 0.5, 5, 2),
-      refreshFps: update.refreshFps === 60 ? 60 : 30
+      refreshFps: normalizeRefreshFps(update.refreshFps ?? this.state.refreshFps)
     };
     this.persist();
     this.scheduleSync(true);
   }
 
   async setFrequency(hz: number): Promise<void> {
-    this.state.liveWatchFrequency = clampInt(hz, 1, 2000, 50);
+    this.state.liveWatchFrequency = clampInt(hz, 1, 10000, 50);
     this.persist();
     this.scheduleSync(true);
   }
@@ -266,13 +267,16 @@ export class WaveformController implements vscode.Disposable {
           rttAutoInit: Boolean(message.rttAutoInit),
           fontSize: Number(message.fontSize) || this.state.fontSize,
           lineWidth: Number(message.lineWidth) || this.state.lineWidth,
-          refreshFps: Number(message.refreshFps) === 60 ? 60 : 30
+          refreshFps: normalizeRefreshFps(Number(message.refreshFps))
         });
         return;
       case 'openSettings':
         this.scheduleSync(true);
         return;
       case 'refresh':
+        this.lastPushedDataVersion = -1;
+        this.lastPushedChannelSignature = '';
+        this.lastPushedTotalSamples = 0;
         this.scheduleSync(true);
         return;
       default:
@@ -611,12 +615,15 @@ export class WaveformController implements vscode.Disposable {
   }
 
   private scheduleSync(immediate = false): void {
-    if (this.syncTimer) {
-      clearTimeout(this.syncTimer);
-      this.syncTimer = undefined;
-    }
     if (immediate) {
+      if (this.syncTimer) {
+        clearTimeout(this.syncTimer);
+        this.syncTimer = undefined;
+      }
       void this.pushState();
+      return;
+    }
+    if (this.syncTimer) {
       return;
     }
     this.syncTimer = setTimeout(() => {
@@ -628,16 +635,35 @@ export class WaveformController implements vscode.Disposable {
   private async pushState(): Promise<void> {
     const channels = this.dataBuffer.getChannels();
     const channelSignature = channels.map((c) => c.name).join('\u0001');
-    const includeData =
-      this.dataBuffer.version !== this.lastPushedDataVersion ||
-      channelSignature !== this.lastPushedChannelSignature;
+    const dataVersionChanged = this.dataBuffer.version !== this.lastPushedDataVersion;
+    const structureChanged = channelSignature !== this.lastPushedChannelSignature;
+    const canAppend =
+      this.viewProvider.hasView() &&
+      dataVersionChanged &&
+      !structureChanged &&
+      this.dataBuffer.tsSize > 0;
 
+    if (canAppend) {
+      const append = this.buildAppendState();
+      if (append && append.timestampsSec.length > 0) {
+        const viewState = this.buildViewState(channels, false);
+        this.viewProvider.postState(viewState);
+        this.viewProvider.postAppend(append);
+        this.lastPushedDataVersion = this.dataBuffer.version;
+        this.lastPushedChannelSignature = channelSignature;
+        this.lastPushedTotalSamples = append.totalSamples;
+        return;
+      }
+    }
+
+    const includeData = dataVersionChanged || structureChanged;
     const viewState = this.buildViewState(channels, includeData);
     this.viewProvider.postState(viewState);
 
     if (includeData) {
       this.lastPushedDataVersion = this.dataBuffer.version;
       this.lastPushedChannelSignature = channelSignature;
+      this.lastPushedTotalSamples = this.dataBuffer.totalSamples;
     }
   }
 
@@ -662,6 +688,7 @@ export class WaveformController implements vscode.Disposable {
       : this.liveWatchService.isRunning.value;
 
     return {
+      bufferCapacity: this.dataBuffer.capacity,
       variables,
       data: includeData ? this.dataBuffer.snapshot() : undefined,
       status: this.buildStatusText(),
@@ -686,6 +713,14 @@ export class WaveformController implements vscode.Disposable {
     };
   }
 
+  private buildAppendState(): WaveformAppendState | undefined {
+    const append = this.dataBuffer.appendSnapshotSince(this.lastPushedTotalSamples);
+    if (!append) {
+      return undefined;
+    }
+    return append;
+  }
+
   private buildStatusText(): string {
     const channels = this.dataBuffer.getChannels();
     if (!channels.length) {
@@ -700,7 +735,9 @@ export class WaveformController implements vscode.Disposable {
       if (!this.rttService.isRunning.value) {
         return '';
       }
-      return this.rttService.lastError ? `RTT: error` : `RTT: tcp:${this.state.rttPort} (${this.rttService.sampleCount})`;
+      return this.rttService.lastError
+        ? 'RTT: error'
+        : `RTT: tcp:${this.state.rttPort} (${this.rttService.sampleCount})`;
     }
     if (!this.liveWatchService.isRunning.value) {
       return '';
@@ -758,4 +795,14 @@ function clamp(v: number, min: number, max: number, fallback: number): number {
 
 function clampInt(v: number, min: number, max: number, fallback: number): number {
   return Math.round(clamp(v, min, max, fallback));
+}
+
+function normalizeRefreshFps(v: number): number {
+  if (v >= 120) {
+    return 120;
+  }
+  if (v >= 60) {
+    return 60;
+  }
+  return 30;
 }

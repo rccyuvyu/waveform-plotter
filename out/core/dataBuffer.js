@@ -58,6 +58,7 @@ class DataBuffer {
         this._tsSize = 0;
         this._baseTimestampNs = 0n;
         this._version = 0;
+        this._totalSamples = 0;
         this.timestamps = new BigInt64Array(capacity);
     }
     get tsSize() {
@@ -65,6 +66,9 @@ class DataBuffer {
     }
     get version() {
         return this._version;
+    }
+    get totalSamples() {
+        return this._totalSamples;
     }
     get baseTimestampNs() {
         return this._baseTimestampNs;
@@ -100,11 +104,9 @@ class DataBuffer {
             this._tsSize += 1;
         }
         for (const ch of this.channels) {
-            const value = values.get(ch.name);
-            if (value !== undefined) {
-                ch.push(value);
-            }
+            ch.push(values.get(ch.name) ?? Number.NaN);
         }
+        this._totalSamples += 1;
         this._version += 1;
     }
     getTimestamp(index) {
@@ -126,6 +128,39 @@ class DataBuffer {
         this._tsSize = 0;
         this._baseTimestampNs = 0n;
         this._version += 1;
+    }
+    appendSnapshotSince(lastTotalSamples) {
+        if (lastTotalSamples < 0 || lastTotalSamples > this._totalSamples) {
+            return undefined;
+        }
+        const appended = this._totalSamples - lastTotalSamples;
+        if (appended <= 0) {
+            return {
+                totalSamples: this._totalSamples,
+                timestampsSec: [],
+                channels: this.channels.map((ch) => ({ name: ch.name, data: [] }))
+            };
+        }
+        if (appended > this._tsSize) {
+            return undefined;
+        }
+        const startIndex = this._tsSize - appended;
+        const timestampsSec = new Array(appended);
+        for (let i = 0; i < appended; i += 1) {
+            timestampsSec[i] = this.getTimeSeconds(startIndex + i);
+        }
+        return {
+            totalSamples: this._totalSamples,
+            timestampsSec,
+            channels: this.channels.map((ch) => {
+                const data = new Array(Math.min(appended, ch.size));
+                const channelStart = Math.max(0, ch.size - appended);
+                for (let i = 0; i < data.length; i += 1) {
+                    data[i] = ch.get(channelStart + i);
+                }
+                return { name: ch.name, data };
+            })
+        };
     }
     snapshot() {
         const timestampsSec = new Array(this._tsSize);

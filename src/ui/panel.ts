@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 
 export interface WaveformViewState {
+  bufferCapacity: number;
   variables: Array<{
     name: string;
     checked: boolean;
@@ -31,6 +32,12 @@ export interface WaveformViewState {
     rttRamSize: string;
     rttAutoInit: boolean;
   };
+}
+
+export interface WaveformAppendState {
+  totalSamples: number;
+  timestampsSec: number[];
+  channels: Array<{ name: string; data: number[] }>;
 }
 
 export type UiMessageHandler = (message: any) => void;
@@ -69,12 +76,23 @@ export class WaveformViewProvider implements vscode.WebviewViewProvider {
     this.handler = handler;
   }
 
+  hasView(): boolean {
+    return !!this.view;
+  }
+
   postState(state: WaveformViewState): void {
     if (!this.view) {
       this.pendingState = state;
       return;
     }
     void this.view.webview.postMessage({ type: 'state', state });
+  }
+
+  postAppend(append: WaveformAppendState): void {
+    if (!this.view) {
+      return;
+    }
+    void this.view.webview.postMessage({ type: 'append', append });
   }
 
   async reveal(): Promise<void> {
@@ -114,8 +132,8 @@ export class WaveformViewProvider implements vscode.WebviewViewProvider {
       <option>Telnet</option>
       <option>RTT</option>
     </select>
-    <input id="freqInput" type="number" min="1" max="2000" step="1" />
-    <label id="freqLabel">Hz</label>
+    <input id="freqInput" type="number" min="1" max="10000" step="1" />
+    <label id="freqLabel">Target Hz</label>
     <button id="settingsBtn">⚙</button>
   </div>
 
@@ -151,6 +169,7 @@ export class WaveformViewProvider implements vscode.WebviewViewProvider {
         <select id="refreshFps">
           <option value="30">30 fps</option>
           <option value="60">60 fps</option>
+          <option value="120">120 fps</option>
         </select>
       </label>
       <div class="actions">

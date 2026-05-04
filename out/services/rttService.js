@@ -6,12 +6,14 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.RttService = void 0;
 const net_1 = __importDefault(require("net"));
 const telnetClient_1 = require("./telnetClient");
+const sampleRateMeter_1 = require("./sampleRateMeter");
 class RttService {
     constructor(dataBuffer, onData) {
         this.dataBuffer = dataBuffer;
         this.onData = onData;
         this.isRunning = { value: false };
         this.sampleCount = 0;
+        this.sampleRateMeter = new sampleRateMeter_1.SampleRateMeter();
         this.readerBuffer = '';
         this.channelNames = [];
         this.lastCallbackNs = 0n;
@@ -90,6 +92,7 @@ class RttService {
         this.lastError = undefined;
         this.readerBuffer = '';
         this.lastCallbackNs = 0n;
+        this.sampleRateMeter.reset();
         try {
             const socket = net_1.default.createConnection({ host, port });
             this.socket = socket;
@@ -126,6 +129,7 @@ class RttService {
     }
     async stopRtt() {
         this.isRunning.value = false;
+        this.sampleRateMeter.reset();
         const s = this.socket;
         this.socket = undefined;
         this.readerBuffer = '';
@@ -187,13 +191,17 @@ class RttService {
                 this.dataBuffer.addChannel(name);
             }
         }
-        this.dataBuffer.pushAll(values, process.hrtime.bigint());
-        this.sampleCount += 1;
         const now = process.hrtime.bigint();
+        this.dataBuffer.pushAll(values, now);
+        this.sampleCount += 1;
+        this.sampleRateMeter.mark(now);
         if (now - this.lastCallbackNs >= 16000000n) {
             this.lastCallbackNs = now;
             this.onData();
         }
+    }
+    getActualFrequencyHz() {
+        return this.sampleRateMeter.getHz();
     }
 }
 exports.RttService = RttService;

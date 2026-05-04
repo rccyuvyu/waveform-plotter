@@ -14,7 +14,7 @@ exports.DEFAULT_STATE = {
     rttAutoInit: true,
     fontSize: 12,
     lineWidth: 2,
-    refreshFps: 30,
+    refreshFps: 60,
     displayMode: 'TIME',
     timeUnit: 'ms'
 };

@@ -4,6 +4,7 @@ exports.LiveWatchService = void 0;
 const passiveCollector_1 = require("./passiveCollector");
 const telnetClient_1 = require("./telnetClient");
 const elfSymbolResolver_1 = require("./elfSymbolResolver");
+const sampleRateMeter_1 = require("./sampleRateMeter");
 const RESPONSE_PATTERN = /0x[0-9a-fA-F]+:\s+([0-9a-fA-F]+)(?:\s+([0-9a-fA-F]+))?/;
 class LiveWatchService {
     constructor(dataBuffer, onData) {
@@ -12,8 +13,10 @@ class LiveWatchService {
         this.isRunning = { value: false };
         this.elfResolver = new elfSymbolResolver_1.ElfSymbolResolver();
         this.sampleCount = 0;
+        this.sampleRateMeter = new sampleRateMeter_1.SampleRateMeter();
         this.watchEntries = new Map();
         this.sampleBusy = false;
+        this.loopGeneration = 0;
     }
     getResolvedEntries() {
         return Object.fromEntries(this.watchEntries.entries());
@@ -131,6 +134,7 @@ class LiveWatchService {
         this.isRunning.value = true;
         this.sampleCount = 0;
         this.lastError = undefined;
+        this.sampleRateMeter.reset();
         const client = new telnetClient_1.TelnetClient();
         try {
             await client.connect('127.0.0.1', telnetPort);
@@ -143,21 +147,32 @@ class LiveWatchService {
             return;
         }
         const intervalMs = Math.max(1, Math.floor(1000 / Math.max(1, frequencyHz)));
-        this.loopTimer = setInterval(() => {
-            void this.sampleOnce();
-        }, intervalMs);
+        const generation = ++this.loopGeneration;
+        void this.runLoop(intervalMs, generation);
     }
     async stopLiveWatch() {
         this.isRunning.value = false;
-        if (this.loopTimer) {
-            clearInterval(this.loopTimer);
-            this.loopTimer = undefined;
-        }
+        this.loopGeneration += 1;
         if (this.client) {
             await this.client.close();
             this.client = undefined;
         }
         this.sampleBusy = false;
+        this.sampleRateMeter.reset();
+    }
+    getActualFrequencyHz() {
+        return this.sampleRateMeter.getHz();
+    }
+    async runLoop(intervalMs, generation) {
+        while (this.isRunning.value && generation === this.loopGeneration) {
+            const startNs = process.hrtime.bigint();
+            await this.sampleOnce();
+            const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1_000_000;
+            const waitMs = Math.max(0, intervalMs - elapsedMs);
+            if (waitMs > 0) {
+                await sleep(waitMs);
+            }
+        }
     }
     async sampleOnce() {
         if (!this.isRunning.value || this.sampleBusy) {
@@ -194,8 +209,10 @@ class LiveWatchService {
                         this.dataBuffer.addChannel(name);
                     }
                 }
-                this.dataBuffer.pushAll(values, process.hrtime.bigint());
+                const nowNs = process.hrtime.bigint();
+                this.dataBuffer.pushAll(values, nowNs);
                 this.sampleCount += 1;
+                this.sampleRateMeter.mark(nowNs);
                 this.lastError = undefined;
                 this.onData();
             }
@@ -275,6 +292,9 @@ class LiveWatchService {
     }
 }
 exports.LiveWatchService = LiveWatchService;
+async function sleep(ms) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+}
 function buildTelnetReadCommand(entry) {
     const addr = `0x${entry.address.toString(16)}`;
     switch (entry.dataType) {
