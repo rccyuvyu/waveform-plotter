@@ -6,6 +6,7 @@ import { DEFAULT_STATE, PersistedState } from './core/types';
 import { LiveWatchService } from './services/liveWatchService';
 import { PassiveCollector } from './services/passiveCollector';
 import { RttService } from './services/rttService';
+import { OpenOcdPortDetector } from './services/openocdPortDetector';
 import { WaveformViewProvider, WaveformViewState } from './ui/panel';
 
 export class WaveformController implements vscode.Disposable {
@@ -15,11 +16,14 @@ export class WaveformController implements vscode.Disposable {
   private readonly passiveCollector: PassiveCollector;
   private readonly liveWatchService: LiveWatchService;
   private readonly rttService: RttService;
+  private readonly openOcdPortDetector = new OpenOcdPortDetector();
   private currentDebugSession: vscode.DebugSession | undefined;
   private currentStoppedThreadId: number | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private syncTimer: NodeJS.Timeout | undefined;
   private autoLoadedSessions = new Set<string>();
+  private lastPushedDataVersion = -1;
+  private lastPushedChannelSignature = '';
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -306,6 +310,13 @@ export class WaveformController implements vscode.Disposable {
               this.currentStoppedThreadId = message?.body?.threadId;
               this.passiveCollector.rememberStoppedThread(this.currentStoppedThreadId);
               void this.tryAutoLoadElf(session);
+              if (this.liveWatchService.isRunning.value) {
+                void this.liveWatchService.refineResolvedTypes(
+                  session,
+                  [...this.state.trackedVariables],
+                  this.currentStoppedThreadId
+                );
+              }
               if (this.passiveCollector.recording) {
                 void this.passiveCollector
                   .collectFromSession(session, [...this.state.trackedVariables])
@@ -356,6 +367,12 @@ export class WaveformController implements vscode.Disposable {
       return;
     }
 
+    const telnetPort = await this.resolveOpenOcdTelnetPort(session);
+    if (!telnetPort) {
+      void vscode.window.showErrorMessage('Unable to find OpenOCD Telnet port automatically. Please check OpenOCD and debug config.');
+      return;
+    }
+
     if (session) {
       await this.tryAutoLoadElf(session);
     }
@@ -374,7 +391,11 @@ export class WaveformController implements vscode.Disposable {
       return;
     }
 
-    await this.liveWatchService.startLiveWatch(this.state.telnetPort, this.state.liveWatchFrequency);
+    if (session) {
+      await this.liveWatchService.refineResolvedTypes(session, tracked, this.currentStoppedThreadId);
+    }
+
+    await this.liveWatchService.startLiveWatch(telnetPort, this.state.liveWatchFrequency);
     if (!this.liveWatchService.isRunning.value) {
       void vscode.window.showErrorMessage(this.liveWatchService.lastError ?? 'Live Watch failed to start.');
       return;
@@ -398,7 +419,14 @@ export class WaveformController implements vscode.Disposable {
     }
 
     if (this.state.rttAutoInit) {
-      const ok = await this.rttService.initOpenOcdRtt(this.state.telnetPort, this.state.rttPort, this.state.rttRamStart, this.state.rttRamSize);
+      const session = this.currentDebugSession ?? vscode.debug.activeDebugSession;
+      const telnetPort = await this.resolveOpenOcdTelnetPort(session);
+      if (!telnetPort) {
+        void vscode.window.showErrorMessage('Unable to find OpenOCD Telnet port automatically. RTT auto-init requires OpenOCD Telnet.');
+        this.scheduleSync(true);
+        return;
+      }
+      const ok = await this.rttService.initOpenOcdRtt(telnetPort, this.state.rttPort, this.state.rttRamStart, this.state.rttRamSize);
       if (!ok) {
         void vscode.window.showErrorMessage(this.rttService.lastError ?? 'RTT init failed.');
         this.scheduleSync(true);
@@ -414,6 +442,136 @@ export class WaveformController implements vscode.Disposable {
     }
 
     this.scheduleSync(true);
+  }
+
+  private async resolveOpenOcdTelnetPort(session?: vscode.DebugSession): Promise<number | undefined> {
+    const hintPorts = this.collectOpenOcdPortHints(session);
+    const detected = await this.openOcdPortDetector.findTelnetPort(this.state.telnetPort, hintPorts);
+    if (!detected) {
+      return undefined;
+    }
+    if (detected !== this.state.telnetPort) {
+      this.state.telnetPort = detected;
+      this.persist();
+      void vscode.window.showInformationMessage(`Waveform Plotter: auto-detected OpenOCD Telnet port ${detected}.`);
+    }
+    return detected;
+  }
+
+  private collectOpenOcdPortHints(session?: vscode.DebugSession): number[] {
+    if (!session) {
+      return [];
+    }
+    const cfg = session.configuration as Record<string, unknown>;
+    const hints = new Set<number>();
+    const gdbPorts = new Set<number>();
+    const tclPorts = new Set<number>();
+
+    const addIfPort = (p: number): void => {
+      if (Number.isInteger(p) && p >= 1 && p <= 65535) {
+        hints.add(p);
+      }
+    };
+
+    const addGdbPort = (p: number): void => {
+      if (Number.isInteger(p) && p >= 1 && p <= 65535) {
+        gdbPorts.add(p);
+      }
+    };
+
+    const addTclPort = (p: number): void => {
+      if (Number.isInteger(p) && p >= 1 && p <= 65535) {
+        tclPorts.add(p);
+      }
+    };
+
+    const parsePortLike = (value: unknown): number | undefined => {
+      if (typeof value === 'number' && Number.isInteger(value)) {
+        return value;
+      }
+      if (typeof value === 'string') {
+        const n = Number.parseInt(value.trim(), 10);
+        if (Number.isInteger(n)) {
+          return n;
+        }
+      }
+      return undefined;
+    };
+
+    // Direct keys: 仅将 telnet 端口直接加入候选；gdb/tcl 只用于推导
+    const directTelnetKeys = ['telnetPort', 'openocdTelnetPort', 'openOcdTelnetPort'];
+    for (const key of directTelnetKeys) {
+      const p = parsePortLike(cfg[key]);
+      if (p !== undefined) {
+        addIfPort(p);
+      }
+    }
+    const directGdbKeys = ['gdbPort', 'gdbport', 'gdbTargetPort'];
+    for (const key of directGdbKeys) {
+      const p = parsePortLike(cfg[key]);
+      if (p !== undefined) {
+        addGdbPort(p);
+      }
+    }
+    const directTclKeys = ['tclPort', 'openocdTclPort', 'openOcdTclPort'];
+    for (const key of directTclKeys) {
+      const p = parsePortLike(cfg[key]);
+      if (p !== undefined) {
+        addTclPort(p);
+      }
+    }
+
+    const extractPorts = (text: string, keyPattern: RegExp, consumer: (p: number) => void): void => {
+      let m: RegExpExecArray | null;
+      while ((m = keyPattern.exec(text)) !== null) {
+        const p = Number.parseInt(m[1], 10);
+        if (Number.isInteger(p) && p >= 1 && p <= 65535) {
+          consumer(p);
+        }
+      }
+    };
+
+    const extractFromText = (text: string): void => {
+      extractPorts(text, /telnet[_ -]?port[^0-9]{0,8}(\d{2,5})/gi, (p) => addIfPort(p));
+      extractPorts(text, /gdb[_ -]?port[^0-9]{0,8}(\d{2,5})/gi, (p) => {
+        addGdbPort(p);
+      });
+      extractPorts(text, /tcl[_ -]?port[^0-9]{0,8}(\d{2,5})/gi, (p) => {
+        addTclPort(p);
+      });
+    };
+
+    const pushAny = (value: unknown): void => {
+      if (value === null || value === undefined) {
+        return;
+      }
+      if (typeof value === 'string') {
+        extractFromText(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          pushAny(item);
+        }
+        return;
+      }
+      if (typeof value === 'object') {
+        for (const v of Object.values(value as Record<string, unknown>)) {
+          pushAny(v);
+        }
+      }
+    };
+
+    pushAny(cfg);
+    // Cortex-Debug 常见映射: gdb/tcl/telnet 连续端口
+    for (const p of gdbPorts) {
+      addIfPort(p + 2);
+    }
+    for (const p of tclPorts) {
+      addIfPort(p + 1);
+    }
+
+    return [...hints].filter((p) => p >= 1 && p <= 65535);
   }
 
   private async stopRtt(): Promise<void> {
@@ -468,13 +626,25 @@ export class WaveformController implements vscode.Disposable {
   }
 
   private async pushState(): Promise<void> {
-    const viewState = this.buildViewState();
+    const channels = this.dataBuffer.getChannels();
+    const channelSignature = channels.map((c) => c.name).join('\u0001');
+    const includeData =
+      this.dataBuffer.version !== this.lastPushedDataVersion ||
+      channelSignature !== this.lastPushedChannelSignature;
+
+    const viewState = this.buildViewState(channels, includeData);
     this.viewProvider.postState(viewState);
+
+    if (includeData) {
+      this.lastPushedDataVersion = this.dataBuffer.version;
+      this.lastPushedChannelSignature = channelSignature;
+    }
   }
 
-  private buildViewState(): WaveformViewState {
-    const snapshot = this.dataBuffer.snapshot();
-    const channels = this.dataBuffer.getChannels();
+  private buildViewState(
+    channels: ReturnType<DataBuffer['getChannels']>,
+    includeData: boolean
+  ): WaveformViewState {
     const variables = this.state.variableNames.map((name) => {
       const ch = channels.find((c) => c.name === name);
       const entry = this.liveWatchService.getResolvedEntries()[name];
@@ -493,7 +663,7 @@ export class WaveformController implements vscode.Disposable {
 
     return {
       variables,
-      data: snapshot,
+      data: includeData ? this.dataBuffer.snapshot() : undefined,
       status: this.buildStatusText(),
       sessionStatus: this.currentDebugSession ? 'Debug session active' : 'No debug session',
       liveStatus: this.buildLiveStatusText(),
@@ -522,31 +692,7 @@ export class WaveformController implements vscode.Disposable {
       return 'Select variables and start recording to see waveforms';
     }
     const maxPoints = channels.reduce((m, ch) => Math.max(m, ch.size), 0);
-    const yRange = this.estimateYRange();
-    return `#${this.passiveCollector.sampleCount + this.liveWatchService.sampleCount + this.rttService.sampleCount} samples | ${maxPoints} pts | Y: [${fmt(yRange.min)}, ${fmt(yRange.max)}]`;
-  }
-
-  private estimateYRange(): { min: number; max: number } {
-    const channels = this.dataBuffer.getChannels();
-    let min = Number.POSITIVE_INFINITY;
-    let max = Number.NEGATIVE_INFINITY;
-    for (const ch of channels) {
-      for (let i = 0; i < ch.size; i += 1) {
-        const v = ch.get(i);
-        if (Number.isNaN(v)) {
-          continue;
-        }
-        min = Math.min(min, v);
-        max = Math.max(max, v);
-      }
-    }
-    if (!Number.isFinite(min) || !Number.isFinite(max)) {
-      return { min: -1, max: 1 };
-    }
-    if (min === max) {
-      return { min: min - 1, max: max + 1 };
-    }
-    return { min, max };
+    return `#${this.passiveCollector.sampleCount + this.liveWatchService.sampleCount + this.rttService.sampleCount} samples | ${maxPoints} pts`;
   }
 
   private buildLiveStatusText(): string {

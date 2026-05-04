@@ -7,7 +7,7 @@ export interface WaveformViewState {
     valueText: string;
     color: string;
   }>;
-  data: {
+  data?: {
     channels: Array<{ name: string; color: string; data: number[] }>;
     timestampsSec: number[];
     version: number;

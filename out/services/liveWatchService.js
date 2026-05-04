@@ -88,6 +88,42 @@ class LiveWatchService {
         }
         return count;
     }
+    /**
+     * 对已解析变量进行类型复核（地址保持不变），用于修正 ELF 仅按 size 猜类型导致的误判。
+     */
+    async refineResolvedTypes(session, varNames, threadId) {
+        if (varNames.length === 0) {
+            return 0;
+        }
+        const t = threadId ?? (await this.pickThreadId(session));
+        if (!t) {
+            return 0;
+        }
+        const frameId = await this.getTopFrameId(session, t);
+        if (frameId === undefined) {
+            return 0;
+        }
+        let updated = 0;
+        for (const name of varNames) {
+            const entry = this.watchEntries.get(name);
+            if (!entry) {
+                continue;
+            }
+            const type = await this.queryDataType(session, name, frameId);
+            if (!type) {
+                continue;
+            }
+            if (type !== entry.dataType) {
+                this.watchEntries.set(name, {
+                    ...entry,
+                    dataType: type,
+                    byteSize: byteSize(type)
+                });
+                updated += 1;
+            }
+        }
+        return updated;
+    }
     async startLiveWatch(telnetPort, frequencyHz) {
         if (this.isRunning.value) {
             return;
@@ -182,6 +218,23 @@ class LiveWatchService {
             if (address === undefined) {
                 return undefined;
             }
+            const dataType = await this.queryDataType(session, varName, frameId);
+            if (!dataType) {
+                return undefined;
+            }
+            return {
+                name: varName,
+                address,
+                dataType,
+                byteSize: byteSize(dataType)
+            };
+        }
+        catch {
+            return undefined;
+        }
+    }
+    async queryDataType(session, varName, frameId) {
+        try {
             const typeResult = (await session.customRequest('evaluate', {
                 expression: `ptype ${varName}`,
                 frameId,
@@ -192,13 +245,7 @@ class LiveWatchService {
                 frameId,
                 context: 'repl'
             }));
-            const dataType = inferDataType(typeResult.result ?? '', sizeResult.result ?? '');
-            return {
-                name: varName,
-                address,
-                dataType,
-                byteSize: byteSize(dataType)
-            };
+            return inferDataType(typeResult.result ?? '', sizeResult.result ?? '');
         }
         catch {
             return undefined;

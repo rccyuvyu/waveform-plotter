@@ -60,15 +60,20 @@
   const view = {
     yScale: 1,
     yOffset: 0,
+    yAuto: true,
+    timeYBase: { valid: false, min: -1, max: 1 },
+    fftYBase: { valid: false, min: -120, max: 0 },
     xOffsetSec: 0,
     xScaleSPP: 0.001,
     autoTrack: true,
+    xAuto: true,
     userZoomed: false,
     fftXScale: 1,
     fftXOffset: 0,
     hoverX: -1,
     hoverY: -1,
     dragging: false,
+    dragAxisLock: 'none',
     dragStartX: 0,
     dragStartY: 0,
     dragStartXOffsetSec: 0,
@@ -77,7 +82,10 @@
     currentYMin: -1,
     currentYMax: 1,
     fftCache: null,
-    fftCacheVersion: -1
+    fftCacheVersion: -1,
+    lastRenderMs: 0,
+    channelStructSig: '',
+    channelDom: new Map()
   };
 
   const margins = { top: 12, right: 12, bottom: 28, left: 62 };
@@ -94,8 +102,12 @@
       return;
     }
     Object.assign(state, msg.state);
-    state.data = msg.state.data;
-    state.variables = msg.state.variables;
+    if (msg.state.data) {
+      state.data = msg.state.data;
+    }
+    if (msg.state.variables) {
+      state.variables = msg.state.variables;
+    }
     renderControls();
   });
 
@@ -162,6 +174,7 @@
     ui.canvas.addEventListener('mousedown', (e) => {
       if (e.button !== 0) return;
       view.dragging = true;
+      view.dragAxisLock = 'none';
       view.dragStartX = e.offsetX;
       view.dragStartY = e.offsetY;
       view.dragStartXOffsetSec = view.xOffsetSec;
@@ -172,6 +185,7 @@
 
     window.addEventListener('mouseup', () => {
       view.dragging = false;
+      view.dragAxisLock = 'none';
       ui.canvas.style.cursor = 'default';
     });
 
@@ -189,22 +203,41 @@
 
       const dx = x - view.dragStartX;
       const dy = y - view.dragStartY;
+      const absDx = Math.abs(dx);
+      const absDy = Math.abs(dy);
 
-      if (state.displayMode === 'TIME') {
-        view.xOffsetSec = Math.max(0, view.dragStartXOffsetSec - dx * view.xScaleSPP);
-        view.autoTrack = false;
-      } else {
-        const spectra = computeSpectra();
-        const maxBins = spectra[0]?.magnitudes.length || 0;
-        if (maxBins > 0) {
-          const visibleBins = Math.max(2, Math.floor(maxBins / view.fftXScale));
-          const pixelsPerBin = plotW / visibleBins;
-          view.fftXOffset = clampInt(view.dragStartFftXOffset - dx / pixelsPerBin, 0, Math.max(0, maxBins - visibleBins), 0);
+      // 拖拽方向锁定：以上下为主时仅移动 Y，避免 X 轴刻度值被误改
+      if (view.dragAxisLock === 'none' && (absDx > 3 || absDy > 3)) {
+        if (absDy > absDx * 1.25) {
+          view.dragAxisLock = 'y';
+        } else if (absDx > absDy * 1.25) {
+          view.dragAxisLock = 'x';
+        } else {
+          view.dragAxisLock = 'xy';
         }
       }
 
-      const yRange = view.currentYMax - view.currentYMin;
-      view.yOffset = view.dragStartYOffset + (dy / plotH) * yRange;
+      if (view.dragAxisLock !== 'y') {
+        if (state.displayMode === 'TIME') {
+          view.xOffsetSec = Math.max(0, view.dragStartXOffsetSec - dx * view.xScaleSPP);
+          view.autoTrack = false;
+          view.xAuto = false;
+        } else {
+          const spectra = computeSpectra();
+          const maxBins = spectra[0]?.magnitudes.length || 0;
+          if (maxBins > 0) {
+            const visibleBins = Math.max(2, Math.floor(maxBins / view.fftXScale));
+            const pixelsPerBin = plotW / visibleBins;
+            view.fftXOffset = clampInt(view.dragStartFftXOffset - dx / pixelsPerBin, 0, Math.max(0, maxBins - visibleBins), 0);
+          }
+        }
+      }
+
+      if (view.dragAxisLock !== 'x') {
+        const yRange = view.currentYMax - view.currentYMin;
+        view.yOffset = view.dragStartYOffset + (dy / plotH) * yRange;
+        view.yAuto = false;
+      }
     });
 
     ui.canvas.addEventListener('mouseleave', () => {
@@ -215,22 +248,22 @@
     ui.canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-      if (e.shiftKey) {
+      if (e.shiftKey || e.ctrlKey || e.metaKey) {
         if (state.displayMode === 'TIME') {
-          const plotW = width() - margins.left - margins.right;
           const px = e.offsetX - margins.left;
           const mouseTime = view.xOffsetSec + px * view.xScaleSPP;
           const zoomFactor = e.deltaY < 0 ? 1 / 1.2 : 1.2;
           view.xScaleSPP = clampFloat(view.xScaleSPP * zoomFactor, 1e-9, 100, 0.001);
-          if (!view.autoTrack) {
-            view.xOffsetSec = Math.max(0, mouseTime - px * view.xScaleSPP);
-          }
+          view.xOffsetSec = Math.max(0, mouseTime - px * view.xScaleSPP);
+          view.autoTrack = false;
+          view.xAuto = false;
           view.userZoomed = true;
         } else {
           view.fftXScale = clampFloat(view.fftXScale * factor, 0.1, 100, 1);
         }
       } else {
         view.yScale = clampFloat(view.yScale * factor, 0.01, 1000, 1);
+        view.yAuto = false;
       }
     }, { passive: false });
   }
@@ -257,8 +290,12 @@
     return ui.canvas.height / dpr;
   }
 
-  function renderLoop() {
-    draw();
+  function renderLoop(ts) {
+    const interval = state.refreshFps >= 60 ? 16 : 33;
+    if (ts - view.lastRenderMs >= interval) {
+      view.lastRenderMs = ts;
+      draw();
+    }
     requestAnimationFrame(renderLoop);
   }
 
@@ -294,7 +331,7 @@
     }
 
     const totalDuration = timestamps[timestamps.length - 1];
-    if (view.autoTrack && totalDuration > 0) {
+    if (view.xAuto && totalDuration > 0) {
       if (!view.userZoomed) {
         view.xScaleSPP = (totalDuration * 1.05) / plotW;
         view.xOffsetSec = 0;
@@ -330,16 +367,11 @@
       yMin -= 1;
       yMax += 1;
     }
-
-    const yc = (yMin + yMax) / 2;
-    const yr = (yMax - yMin) / view.yScale;
-    yMin = yc - yr / 2 + view.yOffset;
-    yMax = yc + yr / 2 + view.yOffset;
+    ({ yMin, yMax } = applyViewYRange('TIME', yMin, yMax));
     view.currentYMin = yMin;
     view.currentYMax = yMax;
 
-    const latest = timestamps[timestamps.length - 1];
-    drawTimeGrid(plotW, plotH, yMin, yMax, tStart, tEnd, latest);
+    drawTimeGrid(plotW, plotH, yMin, yMax, tStart, tEnd);
 
     ctx.save();
     ctx.beginPath();
@@ -372,7 +404,7 @@
     ctx.restore();
 
     if (inPlot(view.hoverX, view.hoverY, plotW, plotH)) {
-      drawTimeCrosshair(plotW, plotH, tStart, visibleDuration, latest);
+      drawTimeCrosshair(plotW, plotH, tStart, visibleDuration);
     }
   }
 
@@ -410,11 +442,7 @@
       yMin -= 10;
       yMax += 10;
     }
-
-    const yc = (yMin + yMax) / 2;
-    const yr = (yMax - yMin) / view.yScale;
-    yMin = yc - yr / 2 + view.yOffset;
-    yMax = yc + yr / 2 + view.yOffset;
+    ({ yMin, yMax } = applyViewYRange('FFT', yMin, yMax));
     view.currentYMin = yMin;
     view.currentYMax = yMax;
 
@@ -451,43 +479,60 @@
     }
   }
 
-  function drawTimeGrid(plotW, plotH, yMin, yMax, tStart, tEnd, latestTime) {
+  function drawTimeGrid(plotW, plotH, yMin, yMax, tStart, tEnd) {
     const duration = tEnd - tStart;
-    drawGridBase(plotW, plotH, yMin, yMax);
+    drawYGrid(plotW, plotH, yMin, yMax);
 
     const step = pickFriendlyTimeStep(duration);
     let t = Math.ceil(tStart / step) * step;
     while (t <= tEnd) {
       const x = margins.left + ((t - tStart) / duration) * plotW;
-      drawVGrid(x, margins.top, margins.top + plotH, fmtTime(t - latestTime));
+      drawVGrid(x, margins.top, margins.top + plotH, fmtTime(t));
       t += step;
     }
   }
 
   function drawFFTGrid(plotW, plotH, yMin, yMax, startBin, endBin, freqResolution) {
-    drawGridBase(plotW, plotH, yMin, yMax, 'dB');
-    for (let i = 0; i <= 5; i++) {
-      const x = margins.left + (plotW * i) / 5;
-      const bin = startBin + ((endBin - startBin) * i) / 5;
-      drawVGrid(x, margins.top, margins.top + plotH, fmtFreq(bin * freqResolution));
+    drawYGrid(plotW, plotH, yMin, yMax, 'dB');
+    const freqStart = startBin * freqResolution;
+    const freqEnd = Math.max(freqStart + freqResolution, (endBin - 1) * freqResolution);
+    const freqSpan = freqEnd - freqStart;
+    const step = pickFriendlyValueStep(freqSpan);
+    const epsilon = step * 1e-6;
+    let freq = Math.ceil((freqStart - epsilon) / step) * step;
+    let guard = 0;
+
+    while (freq <= freqEnd + epsilon && guard < 256) {
+      const snapped = snapTick(freq, step);
+      const x = margins.left + ((snapped - freqStart) / freqSpan) * plotW;
+      drawVGrid(x, margins.top, margins.top + plotH, fmtFreq(snapped));
+      freq += step;
+      guard += 1;
     }
   }
 
-  function drawGridBase(plotW, plotH, yMin, yMax, suffix = '') {
+  function drawYGrid(plotW, plotH, yMin, yMax, suffix = '') {
     ctx.strokeStyle = 'rgba(160, 170, 190, 0.22)';
     ctx.fillStyle = '#98a3b8';
     ctx.lineWidth = 1;
     ctx.font = `${Math.max(8, state.fontSize)}px "Fira Code", monospace`;
 
-    for (let i = 0; i <= 5; i++) {
-      const y = margins.top + (plotH * i) / 5;
+    const visibleRange = yMax - yMin;
+    const step = pickFriendlyValueStep(visibleRange);
+    const epsilon = step * 1e-6;
+    let v = Math.ceil((yMin - epsilon) / step) * step;
+    let guard = 0;
+
+    while (v <= yMax + epsilon && guard < 256) {
+      const snapped = snapTick(v, step);
+      const y = margins.top + plotH - ((snapped - yMin) / visibleRange) * plotH;
       ctx.beginPath();
       ctx.moveTo(margins.left, y);
       ctx.lineTo(margins.left + plotW, y);
       ctx.stroke();
-
-      const val = yMax - ((yMax - yMin) * i) / 5;
-      ctx.fillText(`${fmtValue(val)}${suffix}`, 2, y + 4);
+      ctx.fillText(`${fmtValue(snapped)}${suffix}`, 2, y + 4);
+      v += step;
+      guard += 1;
     }
 
     ctx.strokeStyle = 'rgba(160, 170, 190, 0.35)';
@@ -505,12 +550,12 @@
     ctx.fillText(label, x + 2, yBottom + 14);
   }
 
-  function drawTimeCrosshair(plotW, plotH, tStart, visibleDuration, latestTime) {
+  function drawTimeCrosshair(plotW, plotH, tStart, visibleDuration) {
     drawCrosshair(plotW, plotH);
     const relX = (view.hoverX - margins.left) / plotW;
     const hoverTime = tStart + relX * visibleDuration;
     const idx = findIndexAtTime(state.data.timestampsSec, hoverTime);
-    const lines = [{ color: '#d2dae8', text: `t = ${fmtTime(hoverTime - latestTime)}` }];
+    const lines = [{ color: '#d2dae8', text: `t = ${fmtTime(hoverTime)}` }];
     for (const ch of state.data.channels) {
       if (idx < 0 || idx >= ch.data.length) continue;
       lines.push({ color: ch.color, text: `${ch.name}: ${fmtValue(ch.data[idx])}` });
@@ -610,7 +655,9 @@
 
   function renderControls() {
     ui.sourceSel.value = state.dataSource;
-    ui.freqInput.value = String(state.frequencyHz);
+    if (ui.freqInput.value !== String(state.frequencyHz)) {
+      ui.freqInput.value = String(state.frequencyHz);
+    }
     ui.freqInput.style.display = state.dataSource === 'RTT' ? 'none' : '';
     ui.freqLabel.style.display = state.dataSource === 'RTT' ? 'none' : '';
 
@@ -623,53 +670,72 @@
     ui.fftBtn.disabled = state.displayMode === 'FFT';
     ui.timeUnitBtn.style.display = state.displayMode === 'TIME' ? '' : 'none';
 
-    ui.statusLeft.textContent = state.status;
-    ui.statusMid.textContent = state.sessionStatus;
-    ui.statusRight.textContent = state.liveStatus;
+    if (ui.statusLeft.textContent !== state.status) ui.statusLeft.textContent = state.status;
+    if (ui.statusMid.textContent !== state.sessionStatus) ui.statusMid.textContent = state.sessionStatus;
+    if (ui.statusRight.textContent !== state.liveStatus) ui.statusRight.textContent = state.liveStatus;
 
-    renderChannels();
+    renderChannelsSmart();
   }
 
-  function renderChannels() {
-    const el = ui.channels;
-    el.innerHTML = '';
+  function renderChannelsSmart() {
+    const signature = state.variables.map((v) => `${v.name}|${v.color}`).join('\u0001');
+    const structureChanged = signature !== view.channelStructSig;
+    if (structureChanged) {
+      view.channelStructSig = signature;
+      const el = ui.channels;
+      el.innerHTML = '';
+      view.channelDom.clear();
+
+      for (const v of state.variables) {
+        const item = document.createElement('div');
+        item.className = 'chItem';
+        item.style.color = v.color;
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.addEventListener('change', () => {
+          vscode.postMessage({ type: 'toggleTracked', name: v.name, checked: cb.checked });
+        });
+
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = v.name;
+
+        const value = document.createElement('span');
+        value.className = 'value';
+
+        const remove = document.createElement('button');
+        remove.className = 'remove';
+        remove.textContent = '✕';
+        remove.addEventListener('click', () => {
+          vscode.postMessage({ type: 'removeVariable', name: v.name });
+        });
+
+        item.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          vscode.postMessage({ type: 'removeVariable', name: v.name });
+        });
+
+        item.appendChild(cb);
+        item.appendChild(name);
+        item.appendChild(value);
+        item.appendChild(remove);
+        el.appendChild(item);
+
+        view.channelDom.set(v.name, { cb, value });
+      }
+    }
+
     for (const v of state.variables) {
-      const item = document.createElement('div');
-      item.className = 'chItem';
-      item.style.color = v.color;
-
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = !!v.checked;
-      cb.addEventListener('change', () => {
-        vscode.postMessage({ type: 'toggleTracked', name: v.name, checked: cb.checked });
-      });
-
-      const name = document.createElement('span');
-      name.className = 'name';
-      name.textContent = v.name;
-
-      const value = document.createElement('span');
-      value.className = 'value';
-      value.textContent = v.valueText ? ` ${v.valueText}` : '';
-
-      const remove = document.createElement('button');
-      remove.className = 'remove';
-      remove.textContent = '✕';
-      remove.addEventListener('click', () => {
-        vscode.postMessage({ type: 'removeVariable', name: v.name });
-      });
-
-      item.addEventListener('contextmenu', (e) => {
-        e.preventDefault();
-        vscode.postMessage({ type: 'removeVariable', name: v.name });
-      });
-
-      item.appendChild(cb);
-      item.appendChild(name);
-      item.appendChild(value);
-      item.appendChild(remove);
-      el.appendChild(item);
+      const node = view.channelDom.get(v.name);
+      if (!node) continue;
+      if (node.cb.checked !== !!v.checked) {
+        node.cb.checked = !!v.checked;
+      }
+      const text = v.valueText ? ` ${v.valueText}` : '';
+      if (node.value.textContent !== text) {
+        node.value.textContent = text;
+      }
     }
   }
 
@@ -716,6 +782,23 @@
     return 10 * base;
   }
 
+  function pickFriendlyValueStep(visibleRange) {
+    const target = visibleRange / 6;
+    if (target <= 0) return 1;
+    const steps = [1, 2, 5];
+    const exp = Math.floor(Math.log10(target));
+    const base = Math.pow(10, exp);
+    for (const s of steps) {
+      const step = s * base;
+      if (step >= target * 0.7) return step;
+    }
+    return 10 * base;
+  }
+
+  function snapTick(value, step) {
+    return Math.round(value / step) * step;
+  }
+
   function fmtValue(v) {
     if (!Number.isFinite(v)) return 'NaN';
     if (v === 0) return '0';
@@ -755,9 +838,29 @@
     view.xScaleSPP = 0.001;
     view.xOffsetSec = 0;
     view.autoTrack = true;
+    view.xAuto = true;
     view.userZoomed = false;
     view.fftXScale = 1;
     view.fftXOffset = 0;
+    view.yAuto = true;
+    view.timeYBase.valid = false;
+    view.fftYBase.valid = false;
+  }
+
+  function applyViewYRange(mode, rawMin, rawMax) {
+    const base = mode === 'FFT' ? view.fftYBase : view.timeYBase;
+    if (view.yAuto || !base.valid) {
+      base.min = rawMin;
+      base.max = rawMax;
+      base.valid = true;
+    }
+    let min = base.min;
+    let max = base.max;
+    const yc = (min + max) / 2;
+    const yr = (max - min) / view.yScale;
+    min = yc - yr / 2 + view.yOffset;
+    max = yc + yr / 2 + view.yOffset;
+    return { yMin: min, yMax: max };
   }
 
   function roundRect(c, x, y, w, h, r, fill, stroke) {
