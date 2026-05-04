@@ -9,6 +9,9 @@
     timeBtn: document.getElementById('timeBtn'),
     fftBtn: document.getElementById('fftBtn'),
     timeUnitBtn: document.getElementById('timeUnitBtn'),
+    xZoomOutBtn: document.getElementById('xZoomOutBtn'),
+    timeScaleBadge: document.getElementById('timeScaleBadge'),
+    xZoomInBtn: document.getElementById('xZoomInBtn'),
     liveBtn: document.getElementById('liveBtn'),
     sourceSel: document.getElementById('sourceSel'),
     freqInput: document.getElementById('freqInput'),
@@ -133,6 +136,8 @@
       const unit = state.timeUnit === 'ms' ? 'us' : 'ms';
       vscode.postMessage({ type: 'timeUnit', unit });
     });
+    ui.xZoomOutBtn.addEventListener('click', () => zoomTimeAxis(1.2));
+    ui.xZoomInBtn.addEventListener('click', () => zoomTimeAxis(1 / 1.2));
     ui.liveBtn.addEventListener('click', () => vscode.postMessage({ type: 'toggleLive' }));
     ui.sourceSel.addEventListener('change', () => vscode.postMessage({ type: 'dataSource', source: ui.sourceSel.value }));
     ui.freqInput.addEventListener('change', () => {
@@ -308,6 +313,7 @@
 
     const plotW = w - margins.left - margins.right;
     const plotH = h - margins.top - margins.bottom;
+    updateTimeScaleBadge(plotW);
     if (plotW <= 0 || plotH <= 0) return;
 
     const channels = state.data.channels;
@@ -669,6 +675,11 @@
     ui.timeBtn.disabled = state.displayMode === 'TIME';
     ui.fftBtn.disabled = state.displayMode === 'FFT';
     ui.timeUnitBtn.style.display = state.displayMode === 'TIME' ? '' : 'none';
+    ui.xZoomOutBtn.style.display = state.displayMode === 'TIME' ? '' : 'none';
+    ui.xZoomInBtn.style.display = state.displayMode === 'TIME' ? '' : 'none';
+    ui.timeScaleBadge.style.display = state.displayMode === 'TIME' ? '' : 'none';
+    ui.xZoomOutBtn.disabled = state.displayMode !== 'TIME';
+    ui.xZoomInBtn.disabled = state.displayMode !== 'TIME';
 
     if (ui.statusLeft.textContent !== state.status) ui.statusLeft.textContent = state.status;
     if (ui.statusMid.textContent !== state.sessionStatus) ui.statusMid.textContent = state.sessionStatus;
@@ -780,6 +791,37 @@
       if (step >= target * 0.7) return step;
     }
     return 10 * base;
+  }
+
+  function zoomTimeAxis(zoomFactor) {
+    if (state.displayMode !== 'TIME') return;
+    const plotW = width() - margins.left - margins.right;
+    if (plotW <= 0) return;
+    const anchorRatio = 0.5;
+    const anchorTime = view.xOffsetSec + anchorRatio * plotW * view.xScaleSPP;
+    view.xScaleSPP = clampFloat(view.xScaleSPP * zoomFactor, 1e-9, 100, 0.001);
+    view.xOffsetSec = Math.max(0, anchorTime - anchorRatio * plotW * view.xScaleSPP);
+    view.autoTrack = false;
+    view.xAuto = false;
+    view.userZoomed = true;
+    updateTimeScaleBadge(plotW);
+  }
+
+  function updateTimeScaleBadge(plotW) {
+    if (!ui.timeScaleBadge) return;
+    if (state.displayMode !== 'TIME') {
+      if (ui.timeScaleBadge.textContent !== 'X Tick --') {
+        ui.timeScaleBadge.textContent = 'X Tick --';
+      }
+      return;
+    }
+    const safePlotW = Math.max(1, plotW || width() - margins.left - margins.right);
+    const visibleDuration = Math.max(view.xScaleSPP * safePlotW, 0);
+    const tick = pickFriendlyTimeStep(visibleDuration);
+    const label = `X Tick ${fmtTime(tick)}`;
+    if (ui.timeScaleBadge.textContent !== label) {
+      ui.timeScaleBadge.textContent = label;
+    }
   }
 
   function pickFriendlyValueStep(visibleRange) {

@@ -92,6 +92,9 @@ class WaveformViewProvider {
     <button id="timeBtn">Time</button>
     <button id="fftBtn">FFT</button>
     <button id="timeUnitBtn">ms</button>
+    <button id="xZoomOutBtn" title="Zoom out time axis">X-</button>
+    <span id="timeScaleBadge" class="metricBadge">X Tick --</span>
+    <button id="xZoomInBtn" title="Zoom in time axis">X+</button>
     <span class="split"></span>
     <button id="liveBtn">▶ Live</button>
     <select id="sourceSel">

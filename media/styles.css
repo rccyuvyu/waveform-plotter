@@ -40,6 +40,18 @@ select {
   font: inherit;
 }
 
+.metricBadge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 button:hover {
   border-color: #4b6a8a;
 }
