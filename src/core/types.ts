@@ -19,9 +19,21 @@ export interface WatchEntry {
   byteSize: number;
 }
 
+export interface TreeViewRow {
+  name: string;
+  displayName: string;
+  depth: number;
+  valueText: string;
+  dataType: string;
+  address: string;
+  hasChildren: boolean;
+  expanded: boolean;
+}
+
 export interface PersistedState {
   variableNames: string[];
   trackedVariables: string[];
+  expandedNodes: string[];
   liveWatchFrequency: number;
   telnetPort: number;
   resolvedAddresses: Record<string, string>;
@@ -40,6 +52,7 @@ export interface PersistedState {
 export const DEFAULT_STATE: PersistedState = {
   variableNames: [],
   trackedVariables: [],
+  expandedNodes: [],
   liveWatchFrequency: 50,
   telnetPort: 4444,
   resolvedAddresses: {},

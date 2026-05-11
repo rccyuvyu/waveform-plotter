@@ -10,9 +10,15 @@ interface SymbolInfo {
   section: string;
 }
 
+interface ResolvedSymbolMatch {
+  symbolName: string;
+  info: SymbolInfo;
+}
+
 export class ElfSymbolResolver {
   private symbolCache = new Map<string, SymbolInfo>();
   private shortNameIndex = new Map<string, string[]>();
+  private typeCache = new Map<string, DataType | null>();
   lastElfPath: string | undefined;
   private lastModified = 0;
 
@@ -37,6 +43,7 @@ export class ElfSymbolResolver {
 
     this.symbolCache.clear();
     this.shortNameIndex.clear();
+    this.typeCache.clear();
     this.parseNmOutput(output);
     this.buildShortNameIndex();
     this.lastElfPath = elfPath;
@@ -44,23 +51,40 @@ export class ElfSymbolResolver {
     return this.symbolCache.size > 0;
   }
 
-  resolveVariable(varName: string): WatchEntry | undefined {
+  async resolveVariable(varName: string): Promise<WatchEntry | undefined> {
+    const match = this.findSymbol(varName);
+    if (!match) {
+      return undefined;
+    }
+    return this.buildEntry(varName, match);
+  }
+
+  private findSymbol(varName: string): ResolvedSymbolMatch | undefined {
     const direct = this.symbolCache.get(varName);
     if (direct) {
-      const dt = this.inferDataTypeFromSize(direct.size);
-      return { name: varName, address: direct.address, dataType: dt, byteSize: this.byteSize(dt) };
+      return { symbolName: varName, info: direct };
     }
 
     const candidates = this.shortNameIndex.get(varName);
     if (candidates && candidates.length > 0) {
-      const matched = this.symbolCache.get(candidates[0]);
+      const matchedName = candidates[0];
+      const matched = this.symbolCache.get(matchedName);
       if (matched) {
-        const dt = this.inferDataTypeFromSize(matched.size);
-        return { name: varName, address: matched.address, dataType: dt, byteSize: this.byteSize(dt) };
+        return { symbolName: matchedName, info: matched };
       }
     }
 
     return undefined;
+  }
+
+  private async buildEntry(name: string, match: ResolvedSymbolMatch): Promise<WatchEntry | undefined> {
+    const { symbolName, info } = match;
+    const exactType = await this.inferDataTypeFromDebug(symbolName, info.size);
+    const dt = exactType ?? this.inferDataTypeFromSize(info.size);
+    if (!dt) {
+      return undefined;
+    }
+    return { name, address: info.address, dataType: dt, byteSize: this.byteSize(dt) };
   }
 
   getSymbolCount(): number {
@@ -74,6 +98,7 @@ export class ElfSymbolResolver {
   clear(): void {
     this.symbolCache.clear();
     this.shortNameIndex.clear();
+    this.typeCache.clear();
     this.lastElfPath = undefined;
     this.lastModified = 0;
   }
@@ -116,18 +141,18 @@ export class ElfSymbolResolver {
     }
   }
 
-  private inferDataTypeFromSize(size: number): DataType {
+  private inferDataTypeFromSize(size: number): DataType | undefined {
     switch (size) {
       case 1:
         return 'UINT8';
       case 2:
         return 'INT16';
       case 4:
-        return 'FLOAT';
+        return 'INT32';
       case 8:
         return 'DOUBLE';
       default:
-        return 'INT32';
+        return undefined;
     }
   }
 
@@ -163,6 +188,71 @@ export class ElfSymbolResolver {
         clearTimeout(timeout);
         if (code === 0) {
           resolve(Buffer.concat(chunks).toString('utf8'));
+          return;
+        }
+        resolve(undefined);
+      });
+      proc.on('error', () => {
+        clearTimeout(timeout);
+        resolve(undefined);
+      });
+    });
+  }
+
+  private async inferDataTypeFromDebug(symbolName: string, fallbackSize: number): Promise<DataType | undefined> {
+    if (!this.lastElfPath || !fs.existsSync(this.lastElfPath)) {
+      return undefined;
+    }
+
+    const cacheKey = `${this.lastElfPath}:${this.lastModified}:${symbolName}`;
+    if (this.typeCache.has(cacheKey)) {
+      return this.typeCache.get(cacheKey) ?? undefined;
+    }
+
+    const gdb = await this.findGdbTool();
+    if (!gdb) {
+      return undefined;
+    }
+
+    const output = await this.runGdbInspect(gdb, this.lastElfPath, symbolName);
+    if (!output) {
+      this.typeCache.set(cacheKey, null);
+      return undefined;
+    }
+
+    const whatisMatch = output.match(/type\s*=\s*(.+)/i);
+    const sizeMatch = output.match(/\$\d+\s*=\s*(\d+)/);
+    const dataType = inferDataType(whatisMatch?.[1]?.trim() ?? '', sizeMatch?.[1] ?? String(fallbackSize));
+    this.typeCache.set(cacheKey, dataType ?? null);
+    return dataType ?? undefined;
+  }
+
+  private async runGdbInspect(gdbPath: string, elfPath: string, symbolName: string): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      const args = [
+        '-q',
+        '--batch',
+        elfPath,
+        '-ex',
+        'set pagination off',
+        '-ex',
+        `whatis ${symbolName}`,
+        '-ex',
+        `print (int)sizeof(${symbolName})`
+      ];
+      const proc = spawn(gdbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      const timeout = setTimeout(() => {
+        proc.kill('SIGKILL');
+      }, 10000);
+
+      proc.stdout.on('data', (buf: Buffer) => stdoutChunks.push(buf));
+      proc.stderr.on('data', (buf: Buffer) => stderrChunks.push(buf));
+      proc.on('close', (code) => {
+        clearTimeout(timeout);
+        if (code === 0) {
+          resolve(Buffer.concat(stdoutChunks).toString('utf8'));
           return;
         }
         resolve(undefined);
@@ -212,6 +302,36 @@ export class ElfSymbolResolver {
     return undefined;
   }
 
+  private async findGdbTool(): Promise<string | undefined> {
+    const candidates = ['arm-none-eabi-gdb', 'arm-none-eabi-gdb.exe'];
+    for (const cmd of candidates) {
+      const ok = await this.checkTool(cmd);
+      if (ok) {
+        return cmd;
+      }
+    }
+
+    const common = [
+      '/usr/bin/arm-none-eabi-gdb',
+      '/usr/local/bin/arm-none-eabi-gdb',
+      'C:\\Program Files (x86)\\GNU Arm Embedded Toolchain\\bin\\arm-none-eabi-gdb.exe',
+      'C:\\Program Files\\GNU Arm Embedded Toolchain\\bin\\arm-none-eabi-gdb.exe'
+    ];
+
+    for (const p of common) {
+      if (fs.existsSync(p)) {
+        return p;
+      }
+    }
+
+    const fromEnv = process.env.ARM_NONE_EABI_GDB;
+    if (fromEnv && fs.existsSync(fromEnv)) {
+      return fromEnv;
+    }
+
+    return undefined;
+  }
+
   private async checkTool(cmd: string): Promise<boolean> {
     return new Promise((resolve) => {
       const proc = spawn(cmd, ['--version'], { stdio: ['ignore', 'ignore', 'ignore'] });
@@ -229,4 +349,37 @@ export class ElfSymbolResolver {
       });
     });
   }
+}
+
+function inferDataType(typeText: string, sizeText: string): DataType | undefined {
+  const lower = typeText.toLowerCase();
+  if (/^(struct|class|union)\b/.test(lower)) {
+    return undefined;
+  }
+
+  const size = Number.parseInt(sizeText, 10);
+  const byteSize = Number.isFinite(size) && size > 0 ? size : 0;
+  const isFloat = /\bfloat\b/.test(lower);
+  const isDouble = /\bdouble\b/.test(lower);
+  const isUnsigned = /\bunsigned\b|\buint\d*_t\b|\bbool\b/.test(lower);
+
+  if (isDouble) {
+    return 'DOUBLE';
+  }
+  if (isFloat) {
+    return 'FLOAT';
+  }
+  if (byteSize === 1) {
+    return isUnsigned ? 'UINT8' : 'INT8';
+  }
+  if (byteSize === 2) {
+    return isUnsigned ? 'UINT16' : 'INT16';
+  }
+  if (byteSize === 4) {
+    return isUnsigned ? 'UINT32' : 'INT32';
+  }
+  if (byteSize === 8) {
+    return 'DOUBLE';
+  }
+  return undefined;
 }

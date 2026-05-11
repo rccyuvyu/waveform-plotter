@@ -4,6 +4,7 @@ exports.DEFAULT_STATE = void 0;
 exports.DEFAULT_STATE = {
     variableNames: [],
     trackedVariables: [],
+    expandedNodes: [],
     liveWatchFrequency: 50,
     telnetPort: 4444,
     resolvedAddresses: {},

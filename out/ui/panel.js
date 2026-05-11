@@ -118,13 +118,34 @@ class WaveformViewProvider {
   <div class="inputRow">
     <label>Variable:</label>
     <input id="varInput" type="text" placeholder="变量名或表达式" />
-    <button id="addBtn">+ Add</button>
+    <button id="addBtn" type="button">+ Add</button>
   </div>
 
   <div class="channels" id="channels"></div>
 
   <div class="plotWrap">
     <canvas id="plotCanvas"></canvas>
+  </div>
+
+  <div class="variable-inspector" id="variableInspector">
+    <div class="inspector-header" id="inspectorHeader">
+      <span class="inspector-title">Variable Inspector</span>
+      <span id="inspectorToggle">&#9660;</span>
+    </div>
+    <div class="inspector-body" id="inspectorBody">
+      <table class="inspector-table">
+        <colgroup>
+          <col style="width:40%">
+          <col style="width:30%">
+          <col style="width:14%">
+          <col style="width:16%">
+        </colgroup>
+        <thead>
+          <tr><th>Name</th><th>Value</th><th>Type</th><th>Address</th></tr>
+        </thead>
+        <tbody id="inspectorTbody"></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="statusRow">
@@ -134,7 +155,7 @@ class WaveformViewProvider {
   </div>
 
   <dialog id="settingsDlg">
-    <form method="dialog">
+    <form id="settingsForm" method="dialog">
       <h3>Settings</h3>
       <label>Telnet Port <input id="telnetPort" type="number" min="1" max="65535" /></label>
       <label>RTT Port <input id="rttPort" type="number" min="1" max="65535" /></label>
@@ -151,8 +172,8 @@ class WaveformViewProvider {
         </select>
       </label>
       <div class="actions">
-        <button value="cancel">Cancel</button>
-        <button id="saveSettingsBtn" value="default">Save</button>
+        <button id="cancelSettingsBtn" type="submit" value="cancel">Cancel</button>
+        <button id="saveSettingsBtn" type="submit" value="default">Save</button>
       </div>
     </form>
   </dialog>

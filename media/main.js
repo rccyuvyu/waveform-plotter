@@ -24,6 +24,7 @@
     statusMid: document.getElementById('statusMid'),
     statusRight: document.getElementById('statusRight'),
     settingsDlg: document.getElementById('settingsDlg'),
+    settingsForm: document.getElementById('settingsForm'),
     telnetPort: document.getElementById('telnetPort'),
     rttPort: document.getElementById('rttPort'),
     ramStart: document.getElementById('ramStart'),
@@ -33,12 +34,17 @@
     lineWidth: document.getElementById('lineWidth'),
     refreshFps: document.getElementById('refreshFps'),
     saveSettingsBtn: document.getElementById('saveSettingsBtn'),
+    inspectorBody: document.getElementById('inspectorBody'),
+    inspectorTbody: document.getElementById('inspectorTbody'),
+    inspectorHeader: document.getElementById('inspectorHeader'),
+    inspectorToggle: document.getElementById('inspectorToggle'),
     canvas: document.getElementById('plotCanvas')
   };
 
   const state = {
     bufferCapacity: 10000,
     data: { channels: [], timestampsSec: [], version: 0 },
+    treeVariables: [],
     variables: [],
     status: '',
     sessionStatus: '',
@@ -92,6 +98,11 @@
     channelDom: new Map()
   };
 
+  const inspState = {
+    prevTreeSig: '',
+    editingRowName: null,
+  };
+
   const margins = { top: 12, right: 12, bottom: 28, left: 62 };
   const ctx = ui.canvas.getContext('2d');
   let dpr = window.devicePixelRatio || 1;
@@ -116,7 +127,11 @@
     if (msg.state.variables) {
       state.variables = msg.state.variables;
     }
+    if (msg.state.treeVariables) {
+      state.treeVariables = msg.state.treeVariables;
+    }
     renderControls();
+    renderVariableTree();
   });
 
   vscode.postMessage({ type: 'refresh' });
@@ -151,7 +166,11 @@
     });
     ui.addBtn.addEventListener('click', addVarFromInput);
     ui.varInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
+      if (e.isComposing) {
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'NumpadEnter') {
+        e.preventDefault();
         addVarFromInput();
       }
     });
@@ -161,19 +180,18 @@
       ui.settingsDlg.showModal();
     });
 
-    ui.saveSettingsBtn.addEventListener('click', () => {
-      const payload = {
-        type: 'saveSettings',
-        telnetPort: clampInt(ui.telnetPort.value, 1, 65535, 4444),
-        rttPort: clampInt(ui.rttPort.value, 1, 65535, 9090),
-        rttRamStart: ui.ramStart.value.trim(),
-        rttRamSize: ui.ramSize.value.trim(),
-        rttAutoInit: ui.autoInit.checked,
-        fontSize: clampInt(ui.fontSize.value, 8, 20, 12),
-        lineWidth: clampFloat(ui.lineWidth.value, 0.5, 5, 2),
-        refreshFps: clampInt(ui.refreshFps.value, 30, 120, 60)
-      };
-      vscode.postMessage(payload);
+    ui.saveSettingsBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      saveSettings();
+    });
+
+    ui.settingsForm.addEventListener('submit', (e) => {
+      const submitter = e.submitter && 'id' in e.submitter ? e.submitter.id : '';
+      if (submitter !== 'saveSettingsBtn') {
+        return;
+      }
+      e.preventDefault();
+      saveSettings();
     });
 
     ui.canvas.addEventListener('contextmenu', (e) => {
@@ -276,6 +294,13 @@
         view.yAuto = false;
       }
     }, { passive: false });
+
+    ui.inspectorHeader.addEventListener('click', () => {
+      const body = ui.inspectorBody;
+      const toggle = ui.inspectorToggle;
+      body.classList.toggle('collapsed');
+      toggle.innerHTML = body.classList.contains('collapsed') ? '&#9654;' : '&#9660;';
+    });
   }
 
   function setupCanvas() {
@@ -766,6 +791,22 @@
     ui.refreshFps.value = String(state.refreshFps >= 120 ? 120 : state.refreshFps >= 60 ? 60 : 30);
   }
 
+  function saveSettings() {
+    const payload = {
+      type: 'saveSettings',
+      telnetPort: clampInt(ui.telnetPort.value, 1, 65535, 4444),
+      rttPort: clampInt(ui.rttPort.value, 1, 65535, 9090),
+      rttRamStart: ui.ramStart.value.trim(),
+      rttRamSize: ui.ramSize.value.trim(),
+      rttAutoInit: ui.autoInit.checked,
+      fontSize: clampInt(ui.fontSize.value, 8, 20, 12),
+      lineWidth: clampFloat(ui.lineWidth.value, 0.5, 5, 2),
+      refreshFps: clampInt(ui.refreshFps.value, 30, 120, 60)
+    };
+    vscode.postMessage(payload);
+    ui.settingsDlg.close('saved');
+  }
+
   function applyAppend(append) {
     if (!append || !Array.isArray(append.timestampsSec) || !state.data) {
       return;
@@ -957,6 +998,132 @@
     c.closePath();
     if (fill) c.fill();
     if (stroke) c.stroke();
+  }
+
+  function renderVariableTree() {
+    const tree = state.treeVariables || [];
+    const tbody = ui.inspectorTbody;
+    if (!tbody) return;
+
+    const sig = tree.map(function (r) { return r.name + '|' + r.depth + '|' + r.hasChildren + '|' + r.expanded; }).join('');
+    const structChanged = sig !== inspState.prevTreeSig;
+
+    if (structChanged) {
+      inspState.prevTreeSig = sig;
+      tbody.innerHTML = '';
+      if (tree.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.setAttribute('colspan', '4');
+        td.className = 'insp-empty';
+        td.textContent = 'No variables';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      for (let i = 0; i < tree.length; i++) {
+        tbody.appendChild(createTreeRow(tree[i]));
+      }
+    }
+
+    const rows = tbody.querySelectorAll('tr');
+    for (let i = 0; i < Math.min(rows.length, tree.length); i++) {
+      const row = tree[i];
+      const tr = rows[i];
+      const valTd = tr.children[1];
+      if (inspState.editingRowName === row.name) continue;
+      if (!row.hasChildren) {
+        valTd.textContent = row.valueText || '';
+        valTd.className = 'insp-value-cell editable';
+      } else {
+        valTd.textContent = '';
+        valTd.className = 'insp-value-cell';
+      }
+    }
+  }
+
+  function createTreeRow(row) {
+    const tr = document.createElement('tr');
+    tr.className = 'inspector-row';
+
+    const nameTd = document.createElement('td');
+    const indent = document.createElement('span');
+    indent.style.display = 'inline-block';
+    indent.style.width = (row.depth * 16) + 'px';
+    nameTd.appendChild(indent);
+
+    const toggle = document.createElement('span');
+    toggle.className = 'insp-tree-toggle' + (row.hasChildren ? '' : ' leaf');
+    toggle.textContent = row.hasChildren ? (row.expanded ? '▼' : '▶') : '';
+    toggle.addEventListener('click', function (e) {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'toggleExpand', name: row.name });
+    });
+    nameTd.appendChild(toggle);
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'insp-name-text';
+    nameSpan.textContent = row.displayName;
+    nameTd.appendChild(nameSpan);
+    tr.appendChild(nameTd);
+
+    const valTd = document.createElement('td');
+    valTd.className = 'insp-value-cell' + (row.hasChildren ? '' : ' editable');
+    valTd.textContent = row.hasChildren ? '' : (row.valueText || '');
+    if (!row.hasChildren) {
+      valTd.addEventListener('dblclick', function () { startValueEdit(valTd, row); });
+    }
+    tr.appendChild(valTd);
+
+    const typeTd = document.createElement('td');
+    typeTd.className = 'insp-type-cell';
+    typeTd.textContent = row.dataType || '';
+    tr.appendChild(typeTd);
+
+    const addrTd = document.createElement('td');
+    addrTd.className = 'insp-addr-cell';
+    addrTd.textContent = row.address || '';
+    tr.appendChild(addrTd);
+
+    return tr;
+  }
+
+  function startValueEdit(cell, row) {
+    if (inspState.editingRowName) return;
+    inspState.editingRowName = row.name;
+    const originalText = cell.textContent || '';
+    const input = document.createElement('input');
+    input.className = 'insp-value-input';
+    input.value = originalText;
+    cell.textContent = '';
+    cell.appendChild(input);
+    input.focus();
+    input.select();
+
+    function commit() {
+      const val = input.value.trim();
+      if (val && val !== originalText) {
+        vscode.postMessage({ type: 'editVariable', name: row.name, value: val });
+      }
+      cleanup();
+    }
+
+    function cleanup() {
+      inspState.editingRowName = null;
+      cell.textContent = originalText;
+      cell.className = 'insp-value-cell editable';
+    }
+
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commit();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cleanup();
+      }
+    });
+    input.addEventListener('blur', commit);
   }
 
   function clampInt(v, min, max, fallback) {

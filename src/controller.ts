@@ -2,11 +2,10 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { DataBuffer } from './core/dataBuffer';
-import { DEFAULT_STATE, PersistedState } from './core/types';
+import { DEFAULT_STATE, PersistedState, TreeViewRow } from './core/types';
 import { LiveWatchService } from './services/liveWatchService';
 import { PassiveCollector } from './services/passiveCollector';
 import { RttService } from './services/rttService';
-import { OpenOcdPortDetector } from './services/openocdPortDetector';
 import { WaveformAppendState, WaveformViewProvider, WaveformViewState } from './ui/panel';
 
 export class WaveformController implements vscode.Disposable {
@@ -16,15 +15,17 @@ export class WaveformController implements vscode.Disposable {
   private readonly passiveCollector: PassiveCollector;
   private readonly liveWatchService: LiveWatchService;
   private readonly rttService: RttService;
-  private readonly openOcdPortDetector = new OpenOcdPortDetector();
   private currentDebugSession: vscode.DebugSession | undefined;
   private currentStoppedThreadId: number | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private syncTimer: NodeJS.Timeout | undefined;
   private autoLoadedSessions = new Set<string>();
+  private readonly latestPreviewValues = new Map<string, number>();
   private lastPushedDataVersion = -1;
   private lastPushedChannelSignature = '';
   private lastPushedTotalSamples = 0;
+  private persistTask: Promise<void> = Promise.resolve();
+  private suppressAutoLiveUntilNextSession = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -47,6 +48,10 @@ export class WaveformController implements vscode.Disposable {
     await this.loadState();
     this.registerListeners();
     this.rebuildBufferFromState();
+    if (vscode.debug.activeDebugSession) {
+      this.currentDebugSession = vscode.debug.activeDebugSession;
+      void this.ensureRealtimeRunning(vscode.debug.activeDebugSession);
+    }
     this.scheduleSync(true);
   }
 
@@ -76,19 +81,37 @@ export class WaveformController implements vscode.Disposable {
       this.state.variableNames.push(trimmed);
     }
     if (!this.dataBuffer.getChannels().some((c) => c.name === trimmed)) {
-      this.dataBuffer.addChannel(trimmed);
+      const channel = this.dataBuffer.addChannel(trimmed);
+      if (!channel) {
+        void vscode.window.showWarningMessage(
+          `Variable "${trimmed}" was added, but it cannot be plotted because the channel limit (${this.dataBuffer.maxChannels}) has been reached.`
+        );
+      }
     }
     await this.setTracked(trimmed, checked);
+    const session = this.currentDebugSession ?? vscode.debug.activeDebugSession;
+    if (session) {
+      await this.resolveTrackedVariables(session, [trimmed]);
+    }
     this.persist();
     this.scheduleSync(true);
+    if (session) {
+      void this.refreshPreviewValues(session, [trimmed]);
+      void this.ensureRealtimeRunning(session);
+    }
   }
 
   async removeVariable(name: string): Promise<void> {
     const trimmed = name.trim();
     this.state.variableNames = this.state.variableNames.filter((v) => v !== trimmed);
     this.state.trackedVariables = this.state.trackedVariables.filter((v) => v !== trimmed);
+    for (const key of [...this.latestPreviewValues.keys()]) {
+      if (key === trimmed || key.startsWith(`${trimmed}.`)) {
+        this.latestPreviewValues.delete(key);
+      }
+    }
     this.dataBuffer.removeChannel(trimmed);
-    this.liveWatchService.clearResolvedEntries();
+    this.liveWatchService.removeResolvedEntriesByPrefix(trimmed);
     this.persist();
     this.scheduleSync(true);
   }
@@ -109,6 +132,35 @@ export class WaveformController implements vscode.Disposable {
     this.scheduleSync(true);
   }
 
+  private async editVariable(name: string, valueStr: string): Promise<void> {
+    const entry = this.liveWatchService.getResolvedEntries()[name];
+    if (!entry) {
+      return;
+    }
+    const parsed = this.liveWatchService.parseUserValue(valueStr, entry.dataType);
+    if (parsed === null) {
+      void vscode.window.showErrorMessage(`Cannot parse "${valueStr}" as ${entry.dataType}`);
+      return;
+    }
+    const ok = await this.liveWatchService.writeMemory(name, parsed);
+    if (!ok) {
+      void vscode.window.showErrorMessage(`Write failed for ${name}`);
+    }
+    this.scheduleSync();
+  }
+
+  private toggleExpandNode(name: string): void {
+    const set = new Set(this.state.expandedNodes);
+    if (set.has(name)) {
+      set.delete(name);
+    } else {
+      set.add(name);
+    }
+    this.state.expandedNodes = [...set];
+    this.persist();
+    this.scheduleSync(true);
+  }
+
   async startRecording(): Promise<void> {
     this.passiveCollector.recording = true;
     this.persist();
@@ -125,6 +177,7 @@ export class WaveformController implements vscode.Disposable {
     this.dataBuffer.clearAll();
     this.passiveCollector.resetSampleCount();
     this.liveWatchService.clearResolvedEntries();
+    this.latestPreviewValues.clear();
     this.scheduleSync(true);
   }
 
@@ -201,16 +254,20 @@ export class WaveformController implements vscode.Disposable {
   async toggleLive(): Promise<void> {
     if (this.state.dataSource === 'RTT') {
       if (this.rttService.isRunning.value) {
+        this.suppressAutoLiveUntilNextSession = true;
         await this.stopRtt();
       } else {
+        this.suppressAutoLiveUntilNextSession = false;
         await this.startRtt();
       }
       return;
     }
 
     if (this.liveWatchService.isRunning.value) {
+      this.suppressAutoLiveUntilNextSession = true;
       await this.stopLiveWatch();
     } else {
+      this.suppressAutoLiveUntilNextSession = false;
       await this.startLiveWatch();
     }
   }
@@ -279,6 +336,12 @@ export class WaveformController implements vscode.Disposable {
         this.lastPushedTotalSamples = 0;
         this.scheduleSync(true);
         return;
+      case 'editVariable':
+        await this.editVariable(String(message.name ?? ''), String(message.value ?? ''));
+        return;
+      case 'toggleExpand':
+        this.toggleExpandNode(String(message.name ?? ''));
+        return;
       default:
         return;
     }
@@ -289,7 +352,9 @@ export class WaveformController implements vscode.Disposable {
       vscode.debug.onDidStartDebugSession((session) => {
         this.currentDebugSession = session;
         this.currentStoppedThreadId = undefined;
+        this.suppressAutoLiveUntilNextSession = false;
         void this.tryAutoLoadElf(session);
+        void this.ensureRealtimeRunning(session);
         this.scheduleSync(true);
       })
     );
@@ -314,20 +379,21 @@ export class WaveformController implements vscode.Disposable {
               this.currentStoppedThreadId = message?.body?.threadId;
               this.passiveCollector.rememberStoppedThread(this.currentStoppedThreadId);
               void this.tryAutoLoadElf(session);
-              if (this.liveWatchService.isRunning.value) {
-                void this.liveWatchService.refineResolvedTypes(
-                  session,
-                  [...this.state.trackedVariables],
-                  this.currentStoppedThreadId
-                );
-              }
+              const trackedNow = [...this.state.trackedVariables];
+              void this.resolveTrackedVariables(session, trackedNow)
+                .then(async () => {
+                  await this.refreshPreviewValues(session, [...this.state.trackedVariables]);
+                  await this.ensureRealtimeRunning(session);
+                });
               if (this.passiveCollector.recording) {
                 void this.passiveCollector
-                  .collectFromSession(session, [...this.state.trackedVariables])
+                  .collectFromSession(session, trackedNow)
                   .then(() => this.scheduleSync(true));
               }
             }
             if (message?.event === 'continued') {
+              this.currentDebugSession = session;
+              void this.ensureRealtimeRunning(session);
               this.scheduleSync();
             }
           }
@@ -371,32 +437,17 @@ export class WaveformController implements vscode.Disposable {
       return;
     }
 
-    const telnetPort = await this.resolveOpenOcdTelnetPort(session);
-    if (!telnetPort) {
-      void vscode.window.showErrorMessage('Unable to find OpenOCD Telnet port automatically. Please check OpenOCD and debug config.');
-      return;
-    }
+    const telnetPort = this.state.telnetPort;
 
-    if (session) {
-      await this.tryAutoLoadElf(session);
-    }
-    const elfResolved = this.liveWatchService.elfResolver.isLoaded()
-      ? await this.liveWatchService.resolveFromElf(this.liveWatchService.elfResolver.lastElfPath ?? '', tracked)
-      : 0;
+    const resolvedCount = session
+      ? await this.resolveTrackedVariables(session, tracked)
+      : (this.liveWatchService.elfResolver.isLoaded()
+        ? await this.liveWatchService.resolveFromElf(this.liveWatchService.elfResolver.lastElfPath ?? '', tracked)
+        : 0);
 
-    const unresolved = tracked.filter((name) => !this.liveWatchService.getResolvedEntries()[name]);
-    let gdbResolved = 0;
-    if (unresolved.length && session) {
-      gdbResolved = await this.liveWatchService.resolveVariables(session, unresolved, this.currentStoppedThreadId);
-    }
-
-    if (elfResolved + gdbResolved === 0) {
+    if (resolvedCount === 0) {
       void vscode.window.showWarningMessage('Failed to resolve variables. Pause the debugger once and try again.');
       return;
-    }
-
-    if (session) {
-      await this.liveWatchService.refineResolvedTypes(session, tracked, this.currentStoppedThreadId);
     }
 
     await this.liveWatchService.startLiveWatch(telnetPort, this.state.liveWatchFrequency);
@@ -423,13 +474,7 @@ export class WaveformController implements vscode.Disposable {
     }
 
     if (this.state.rttAutoInit) {
-      const session = this.currentDebugSession ?? vscode.debug.activeDebugSession;
-      const telnetPort = await this.resolveOpenOcdTelnetPort(session);
-      if (!telnetPort) {
-        void vscode.window.showErrorMessage('Unable to find OpenOCD Telnet port automatically. RTT auto-init requires OpenOCD Telnet.');
-        this.scheduleSync(true);
-        return;
-      }
+      const telnetPort = this.state.telnetPort;
       const ok = await this.rttService.initOpenOcdRtt(telnetPort, this.state.rttPort, this.state.rttRamStart, this.state.rttRamSize);
       if (!ok) {
         void vscode.window.showErrorMessage(this.rttService.lastError ?? 'RTT init failed.');
@@ -448,142 +493,123 @@ export class WaveformController implements vscode.Disposable {
     this.scheduleSync(true);
   }
 
-  private async resolveOpenOcdTelnetPort(session?: vscode.DebugSession): Promise<number | undefined> {
-    const hintPorts = this.collectOpenOcdPortHints(session);
-    const detected = await this.openOcdPortDetector.findTelnetPort(this.state.telnetPort, hintPorts);
-    if (!detected) {
-      return undefined;
-    }
-    if (detected !== this.state.telnetPort) {
-      this.state.telnetPort = detected;
-      this.persist();
-      void vscode.window.showInformationMessage(`Waveform Plotter: auto-detected OpenOCD Telnet port ${detected}.`);
-    }
-    return detected;
-  }
-
-  private collectOpenOcdPortHints(session?: vscode.DebugSession): number[] {
-    if (!session) {
-      return [];
-    }
-    const cfg = session.configuration as Record<string, unknown>;
-    const hints = new Set<number>();
-    const gdbPorts = new Set<number>();
-    const tclPorts = new Set<number>();
-
-    const addIfPort = (p: number): void => {
-      if (Number.isInteger(p) && p >= 1 && p <= 65535) {
-        hints.add(p);
-      }
-    };
-
-    const addGdbPort = (p: number): void => {
-      if (Number.isInteger(p) && p >= 1 && p <= 65535) {
-        gdbPorts.add(p);
-      }
-    };
-
-    const addTclPort = (p: number): void => {
-      if (Number.isInteger(p) && p >= 1 && p <= 65535) {
-        tclPorts.add(p);
-      }
-    };
-
-    const parsePortLike = (value: unknown): number | undefined => {
-      if (typeof value === 'number' && Number.isInteger(value)) {
-        return value;
-      }
-      if (typeof value === 'string') {
-        const n = Number.parseInt(value.trim(), 10);
-        if (Number.isInteger(n)) {
-          return n;
-        }
-      }
-      return undefined;
-    };
-
-    // Direct keys: 仅将 telnet 端口直接加入候选；gdb/tcl 只用于推导
-    const directTelnetKeys = ['telnetPort', 'openocdTelnetPort', 'openOcdTelnetPort'];
-    for (const key of directTelnetKeys) {
-      const p = parsePortLike(cfg[key]);
-      if (p !== undefined) {
-        addIfPort(p);
-      }
-    }
-    const directGdbKeys = ['gdbPort', 'gdbport', 'gdbTargetPort'];
-    for (const key of directGdbKeys) {
-      const p = parsePortLike(cfg[key]);
-      if (p !== undefined) {
-        addGdbPort(p);
-      }
-    }
-    const directTclKeys = ['tclPort', 'openocdTclPort', 'openOcdTclPort'];
-    for (const key of directTclKeys) {
-      const p = parsePortLike(cfg[key]);
-      if (p !== undefined) {
-        addTclPort(p);
-      }
-    }
-
-    const extractPorts = (text: string, keyPattern: RegExp, consumer: (p: number) => void): void => {
-      let m: RegExpExecArray | null;
-      while ((m = keyPattern.exec(text)) !== null) {
-        const p = Number.parseInt(m[1], 10);
-        if (Number.isInteger(p) && p >= 1 && p <= 65535) {
-          consumer(p);
-        }
-      }
-    };
-
-    const extractFromText = (text: string): void => {
-      extractPorts(text, /telnet[_ -]?port[^0-9]{0,8}(\d{2,5})/gi, (p) => addIfPort(p));
-      extractPorts(text, /gdb[_ -]?port[^0-9]{0,8}(\d{2,5})/gi, (p) => {
-        addGdbPort(p);
-      });
-      extractPorts(text, /tcl[_ -]?port[^0-9]{0,8}(\d{2,5})/gi, (p) => {
-        addTclPort(p);
-      });
-    };
-
-    const pushAny = (value: unknown): void => {
-      if (value === null || value === undefined) {
-        return;
-      }
-      if (typeof value === 'string') {
-        extractFromText(value);
-        return;
-      }
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          pushAny(item);
-        }
-        return;
-      }
-      if (typeof value === 'object') {
-        for (const v of Object.values(value as Record<string, unknown>)) {
-          pushAny(v);
-        }
-      }
-    };
-
-    pushAny(cfg);
-    // Cortex-Debug 常见映射: gdb/tcl/telnet 连续端口
-    for (const p of gdbPorts) {
-      addIfPort(p + 2);
-    }
-    for (const p of tclPorts) {
-      addIfPort(p + 1);
-    }
-
-    return [...hints].filter((p) => p >= 1 && p <= 65535);
-  }
-
   private async stopRtt(): Promise<void> {
     await this.rttService.stopRtt();
     if (this.state.rttAutoInit) {
       await this.rttService.stopOpenOcdRtt(this.state.telnetPort);
     }
     this.scheduleSync(true);
+  }
+
+  /**
+   * 扫描 watchEntries，将所有尚未登记的展开结构体成员加入 variableNames / trackedVariables，
+   * 同时移除已被展开的父变量（不再有直接条目的原始名称）。
+   */
+  private absorbExpandedMembers(): void {
+    const allResolved = this.liveWatchService.getResolvedEntries();
+    const resolvedNames = new Set(Object.keys(allResolved));
+    // 找出已被展开的父变量（在 state 中但不在 resolved 中的名称，且有子成员）
+    const expandedParents = new Set<string>();
+    for (const name of this.state.trackedVariables) {
+      if (resolvedNames.has(name)) {
+        continue;
+      }
+      // 检查是否有子成员（name. 开头的条目）
+      for (const key of resolvedNames) {
+        if (key.startsWith(name + '.')) {
+          expandedParents.add(name);
+          break;
+        }
+      }
+    }
+    // 添加展开的子成员
+    const added = new Set<string>();
+    for (const name of resolvedNames) {
+      if (!name.includes('.')) {
+        continue;
+      }
+      added.add(name);
+      if (!this.state.variableNames.includes(name)) {
+        this.state.variableNames.push(name);
+      }
+      if (!this.state.trackedVariables.includes(name)) {
+        this.state.trackedVariables.push(name);
+      }
+    }
+    // 移除已被展开的父变量
+    for (const parent of expandedParents) {
+      this.state.variableNames = this.state.variableNames.filter((v) => v !== parent);
+      this.state.trackedVariables = this.state.trackedVariables.filter((v) => v !== parent);
+    }
+  }
+
+  /** 根据 variableNames + resolvedEntries 构建变量树行列表 */
+  private buildTreeRows(): TreeViewRow[] {
+    const resolved = this.liveWatchService.getResolvedEntries();
+    const expandedSet = new Set(this.state.expandedNodes);
+
+    // 收集所有节点名（包括从点分名称中提取的父级前缀）
+    const allNodes = new Set<string>();
+    for (const name of this.state.variableNames) {
+      allNodes.add(name);
+      let dot = name.indexOf('.');
+      while (dot > 0) {
+        allNodes.add(name.substring(0, dot));
+        dot = name.indexOf('.', dot + 1);
+      }
+    }
+
+    // 构建直接子节点映射
+    const children = new Map<string, string[]>();
+    const hasChildren = new Set<string>();
+    for (const node of allNodes) {
+      const prefix = node + '.';
+      const direct: string[] = [];
+      for (const other of allNodes) {
+        if (other === node || !other.startsWith(prefix)) {
+          continue;
+        }
+        const rest = other.substring(prefix.length);
+        if (!rest.includes('.')) {
+          direct.push(other);
+        }
+      }
+      if (direct.length > 0) {
+        direct.sort();
+        children.set(node, direct);
+        hasChildren.add(node);
+      }
+    }
+
+    const roots = [...allNodes].filter((n) => !n.includes('.')).sort();
+    const rows: TreeViewRow[] = [];
+
+    const walk = (names: string[], depth: number) => {
+      for (const name of names) {
+        const entry = resolved[name];
+        const displayName = name.includes('.') ? name.substring(name.lastIndexOf('.') + 1) : name;
+        const nodeHasChildren = hasChildren.has(name);
+        const channel = this.dataBuffer.getChannels().find((c) => c.name === name);
+        const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
+        const valueText = this.getDisplayValueText(name, latest, entry?.dataType);
+        rows.push({
+          name,
+          displayName,
+          depth,
+          valueText,
+          dataType: entry?.dataType?.toLowerCase() ?? '',
+          address: entry ? `0x${entry.address.toString(16)}` : '',
+          hasChildren: nodeHasChildren,
+          expanded: expandedSet.has(name)
+        });
+        if (nodeHasChildren && expandedSet.has(name)) {
+          walk(children.get(name)!, depth + 1);
+        }
+      }
+    };
+
+    walk(roots, 0);
+    return rows;
   }
 
   private rebuildBufferFromState(): void {
@@ -609,9 +635,86 @@ export class WaveformController implements vscode.Disposable {
     this.state = { ...structuredClone(DEFAULT_STATE), ...(saved ?? {}) };
   }
 
+  private async refreshPreviewValues(
+    session: vscode.DebugSession,
+    trackedVariables: string[]
+  ): Promise<void> {
+    const values = await this.passiveCollector.readCurrentValues(session, trackedVariables);
+    for (const [name, value] of values.entries()) {
+      this.latestPreviewValues.set(name, value);
+    }
+    if (values.size > 0) {
+      this.scheduleSync(true);
+    }
+  }
+
+  private async resolveTrackedVariables(
+    session: vscode.DebugSession,
+    variableNames: string[]
+  ): Promise<number> {
+    const names = [...new Set(variableNames.map((name) => name.trim()).filter(Boolean))];
+    if (names.length === 0) {
+      return 0;
+    }
+
+    await this.tryAutoLoadElf(session);
+
+    let resolvedCount = 0;
+    if (this.liveWatchService.elfResolver.isLoaded()) {
+      resolvedCount += await this.liveWatchService.resolveFromElf(
+        this.liveWatchService.elfResolver.lastElfPath ?? '',
+        names
+      );
+    }
+
+    const unresolved = names.filter((name) => !this.liveWatchService.getResolvedEntries()[name]);
+    if (unresolved.length > 0) {
+      resolvedCount += await this.liveWatchService.resolveVariables(session, unresolved, this.currentStoppedThreadId);
+    }
+
+    await this.liveWatchService.refineResolvedTypes(session, names, this.currentStoppedThreadId);
+    this.absorbExpandedMembers();
+    this.persist();
+
+    const resolvedEntries = this.liveWatchService.getResolvedEntries();
+    return names.filter((name) =>
+      !!resolvedEntries[name] || Object.keys(resolvedEntries).some((entryName) => entryName.startsWith(`${name}.`))
+    ).length;
+  }
+
+  private async ensureRealtimeRunning(session?: vscode.DebugSession): Promise<void> {
+    if (this.suppressAutoLiveUntilNextSession) {
+      return;
+    }
+
+    const activeSession = session ?? this.currentDebugSession ?? vscode.debug.activeDebugSession;
+    if (!activeSession) {
+      return;
+    }
+
+    const tracked = [...new Set(this.state.trackedVariables.map((name) => name.trim()).filter(Boolean))];
+    if (tracked.length === 0) {
+      return;
+    }
+
+    if (this.state.dataSource === 'RTT') {
+      if (!this.rttService.isRunning.value) {
+        await this.startRtt();
+      }
+      return;
+    }
+
+    if (!this.liveWatchService.isRunning.value) {
+      await this.startLiveWatch();
+    }
+  }
+
   private persist(): void {
     this.state.resolvedAddresses = this.liveWatchService.dumpResolvedEntries();
-    void this.context.workspaceState.update(this.stateKey, this.state);
+    const snapshot = structuredClone(this.state);
+    this.persistTask = this.persistTask
+      .catch(() => undefined)
+      .then(() => this.context.workspaceState.update(this.stateKey, snapshot));
   }
 
   private scheduleSync(immediate = false): void {
@@ -674,7 +777,7 @@ export class WaveformController implements vscode.Disposable {
     const variables = this.state.variableNames.map((name) => {
       const ch = channels.find((c) => c.name === name);
       const entry = this.liveWatchService.getResolvedEntries()[name];
-      const valueText = ch && ch.size > 0 ? formatCompactValue(ch.get(ch.size - 1), entry?.dataType) : '';
+      const valueText = this.getDisplayValueText(name, ch?.size ? ch.get(ch.size - 1) : undefined, entry?.dataType);
       return {
         name,
         checked: this.state.trackedVariables.includes(name),
@@ -691,6 +794,7 @@ export class WaveformController implements vscode.Disposable {
       bufferCapacity: this.dataBuffer.capacity,
       variables,
       data: includeData ? this.dataBuffer.snapshot() : undefined,
+      treeVariables: this.buildTreeRows(),
       status: this.buildStatusText(),
       sessionStatus: this.currentDebugSession ? 'Debug session active' : 'No debug session',
       liveStatus: this.buildLiveStatusText(),
@@ -711,6 +815,17 @@ export class WaveformController implements vscode.Disposable {
         rttAutoInit: this.state.rttAutoInit
       }
     };
+  }
+
+  private getDisplayValueText(name: string, latestBuffered: number | undefined, dataType?: string): string {
+    if (latestBuffered !== undefined && Number.isFinite(latestBuffered)) {
+      return formatCompactValue(latestBuffered, dataType);
+    }
+    const preview = this.latestPreviewValues.get(name);
+    if (preview !== undefined && Number.isFinite(preview)) {
+      return formatCompactValue(preview, dataType);
+    }
+    return '';
   }
 
   private buildAppendState(): WaveformAppendState | undefined {
@@ -742,9 +857,10 @@ export class WaveformController implements vscode.Disposable {
     if (!this.liveWatchService.isRunning.value) {
       return '';
     }
+    const endpointLabel = this.liveWatchService.getLiveEndpointLabel() || `port:${this.state.telnetPort}`;
     return this.liveWatchService.lastError
       ? 'Live: error'
-      : `Live: telnet:${this.state.telnetPort}@${this.state.liveWatchFrequency}Hz (${this.liveWatchService.sampleCount})`;
+      : `Live: ${endpointLabel}@${this.state.liveWatchFrequency}Hz (${this.liveWatchService.sampleCount})`;
   }
 }
 

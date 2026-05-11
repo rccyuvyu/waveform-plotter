@@ -19,41 +19,80 @@ export class PassiveCollector {
       return;
     }
 
-    const threadId = this.lastStoppedThreadId ?? (await this.pickThreadId(session));
-    if (!threadId) {
-      return;
-    }
-
-    const frameId = await this.getTopFrameId(session, threadId);
-    if (frameId === undefined) {
-      return;
-    }
-
-    const values = new Map<string, number>();
-    for (const varName of trackedVariables) {
-      const parsed = await this.evaluateNumber(session, varName, frameId);
-      if (parsed !== undefined) {
-        values.set(varName, parsed);
-      }
-    }
-
+    const values = await this.readCurrentValues(session, trackedVariables);
     if (values.size === 0) {
       return;
     }
 
-    for (const name of trackedVariables) {
+    const collectedNames = [...values.keys()];
+    for (const name of collectedNames) {
       if (!this.dataBuffer.getChannels().some((c) => c.name === name)) {
         this.dataBuffer.addChannel(name);
       }
     }
 
     const aligned = new Map<string, number>();
-    for (const name of trackedVariables) {
+    for (const name of collectedNames) {
       aligned.set(name, values.get(name) ?? Number.NaN);
     }
 
     this.dataBuffer.pushAll(aligned, process.hrtime.bigint());
     this.sampleCount += 1;
+  }
+
+  async readCurrentValues(session: vscode.DebugSession, trackedVariables: string[]): Promise<Map<string, number>> {
+    const values = new Map<string, number>();
+    if (trackedVariables.length === 0) {
+      return values;
+    }
+
+    const threadId = this.lastStoppedThreadId ?? (await this.pickThreadId(session));
+    if (!threadId) {
+      return values;
+    }
+
+    const frameId = await this.getTopFrameId(session, threadId);
+    if (frameId === undefined) {
+      return values;
+    }
+
+    for (const varName of trackedVariables) {
+      const ptype = await this.safeEval(session, `ptype ${varName}`, frameId);
+      if (ptype && isStructType(ptype)) {
+        // 结构体：展开为成员逐个求值
+        const memberNames = parseStructMemberNames(ptype);
+        for (const member of memberNames) {
+          const fullName = `${varName}.${member}`;
+          const memberPtype = await this.safeEval(session, `ptype ${fullName}`, frameId);
+          if (memberPtype && isStructType(memberPtype)) {
+            continue; // 嵌套结构体暂不支持深层展开
+          }
+          const parsed = await this.evaluateNumber(session, fullName, frameId);
+          if (parsed !== undefined) {
+            values.set(fullName, parsed);
+          }
+        }
+      } else {
+        const parsed = await this.evaluateNumber(session, varName, frameId);
+        if (parsed !== undefined) {
+          values.set(varName, parsed);
+        }
+      }
+    }
+    return values;
+  }
+
+  private async safeEval(session: vscode.DebugSession, expression: string, frameId: number): Promise<string | undefined> {
+    try {
+      const result = (await session.customRequest('evaluate', {
+        expression,
+        frameId,
+        context: 'repl'
+      })) as { result?: string };
+      return result?.result?.trim();
+    } catch {
+      return undefined;
+    }
   }
 
   resetSampleCount(): void {
@@ -130,5 +169,64 @@ export function parseDebuggerNumber(raw: string): number | undefined {
     }
   }
 
+  return undefined;
+}
+
+/** 检测 GDB ptype 输出是否为 struct/class/union */
+export function isStructType(ptypeText: string): boolean {
+  const stripped = ptypeText.replace(/^type\s*=\s*/i, '').trim();
+  return /^(struct|class|union)\b/i.test(stripped);
+}
+
+/** 解析 GDB ptype 输出中的顶层成员名（跳过嵌套层级） */
+export function parseStructMemberNames(ptypeOutput: string): string[] {
+  const braceStart = ptypeOutput.indexOf('{');
+  const braceEnd = ptypeOutput.lastIndexOf('}');
+  if (braceStart < 0 || braceEnd < 0 || braceStart >= braceEnd) {
+    return [];
+  }
+
+  const names: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (let i = braceStart + 1; i < braceEnd; i += 1) {
+    const ch = ptypeOutput[i];
+    if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+    } else if (ch === ';' && depth === 0) {
+      const name = extractMemberName(current);
+      if (name) {
+        names.push(name);
+      }
+      current = '';
+    } else if (depth === 0) {
+      current += ch;
+    }
+  }
+
+  return names;
+}
+
+function extractMemberName(declaration: string): string | undefined {
+  const trimmed = declaration.trim();
+  if (!trimmed || trimmed.endsWith('}')) {
+    return undefined;
+  }
+  const tokens = trimmed.split(/\s+/);
+  let last = tokens[tokens.length - 1];
+  const bracket = last.indexOf('[');
+  if (bracket > 0) {
+    last = last.substring(0, bracket);
+  }
+  const colon = last.indexOf(':');
+  if (colon > 0) {
+    last = last.substring(0, colon);
+  }
+  if (last && /^[a-zA-Z_]\w*$/.test(last)) {
+    return last;
+  }
   return undefined;
 }

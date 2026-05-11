@@ -181,3 +181,141 @@ dialog .actions {
   gap: 8px;
   margin-top: 4px;
 }
+
+.variable-inspector {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #121721;
+  max-height: 250px;
+  display: flex;
+  flex-direction: column;
+}
+
+.inspector-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  user-select: none;
+}
+
+.inspector-title {
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+
+.inspector-body {
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1;
+}
+
+.inspector-body.collapsed {
+  display: none;
+}
+
+.inspector-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.inspector-table th {
+  position: sticky;
+  top: 0;
+  background: #1a1f2a;
+  padding: 3px 8px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  user-select: none;
+}
+
+.inspector-table td {
+  padding: 2px 8px;
+  border-bottom: 1px solid rgba(48, 59, 77, 0.3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  height: 22px;
+  vertical-align: middle;
+}
+
+.inspector-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.insp-tree-toggle {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+  font-size: 9px;
+  opacity: 0.6;
+  user-select: none;
+  border-radius: 2px;
+}
+
+.insp-tree-toggle.leaf {
+  visibility: hidden;
+}
+
+.insp-tree-toggle:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.insp-name-text {
+  font-weight: 500;
+}
+
+.insp-value-cell {
+  color: #b5cea8;
+  cursor: default;
+}
+
+.insp-value-cell.editable:hover {
+  background: rgba(255, 255, 255, 0.05);
+  cursor: text;
+}
+
+.insp-value-input {
+  width: 100%;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: 1px solid #007fd4;
+  padding: 0 4px;
+  font-family: inherit;
+  font-size: inherit;
+  outline: none;
+  height: 20px;
+  box-sizing: border-box;
+}
+
+.insp-type-cell {
+  opacity: 0.5;
+  font-size: 10px;
+}
+
+.insp-addr-cell {
+  opacity: 0.4;
+  font-size: 10px;
+}
+
+.insp-empty {
+  padding: 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 11px;
+}
