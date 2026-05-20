@@ -909,7 +909,7 @@ export class WaveformController implements vscode.Disposable {
           address: entry ? `0x${entry.address.toString(16)}` : '',
           hasChildren: nodeHasChildren,
           expanded: expandedSet.has(name),
-          selectable: depth > 0 && !nodeHasChildren,
+          selectable: !nodeHasChildren,
           checkState,
           color: channel?.color ?? '',
           isRoot: depth === 0

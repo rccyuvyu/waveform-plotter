@@ -32,6 +32,8 @@ class LiveWatchService {
         this.endpointLabel = '';
         this.sampleBusy = false;
         this.loopGeneration = 0;
+        /** 预排序的 entries 缓存，避免每轮采样重复排序 */
+        this.cachedSortedEntries = null;
         this.portDetector = new openocdPortDetector_1.OpenOcdPortDetector('127.0.0.1');
     }
     getResolvedEntries() {
@@ -375,13 +377,33 @@ class LiveWatchService {
         void this.runLoopViaSession(entries, intervalMs, generation);
     }
     async runLoopViaSession(entries, intervalMs, generation) {
+        const intervalNs = BigInt(Math.floor(intervalMs * 1_000_000));
+        let nextDeadline = process.hrtime.bigint();
+        // 预排序 entries，避免每轮重复排序
+        const sorted = [...entries].filter(e => e.address !== 0);
+        sorted.sort((a, b) => a.address - b.address);
+        this.cachedSortedEntries = sorted;
         while (this.isRunning.value && generation === this.loopGeneration) {
-            const t0 = Date.now();
+            nextDeadline += intervalNs;
             await this.sampleOnceViaTcl();
-            const elapsed = Date.now() - t0;
-            const sleepMs = Math.max(1, intervalMs - elapsed);
-            await new Promise((r) => setTimeout(r, sleepMs));
+            const now = process.hrtime.bigint();
+            if (nextDeadline > now) {
+                const remaining = Number(nextDeadline - now);
+                if (remaining >= 2_000_000) {
+                    // >=2ms: setTimeout 精度够用
+                    await new Promise((r) => setTimeout(r, Math.floor(remaining / 1_000_000)));
+                }
+                else {
+                    // <2ms: setTimeout 精度不够，用 setImmediate 让出事件循环后立即返回
+                    await new Promise((r) => setImmediate(r));
+                }
+            }
+            else {
+                // 已经落后于计划，让出事件循环后立即继续下一轮
+                await new Promise((r) => setImmediate(r));
+            }
         }
+        this.cachedSortedEntries = null;
     }
     async sampleOnceViaTcl() {
         if (this.sampleBusy || this.clientMode !== 'tcl' || !this.client) {
@@ -390,22 +412,45 @@ class LiveWatchService {
         this.sampleBusy = true;
         try {
             const tcl = this.client;
-            const entries = [...this.watchEntries.values()].filter(e => e.address !== 0);
+            // 使用预排序缓存，避免每轮重复 filter + sort
+            const all = [...this.watchEntries.values()].filter(e => e.address !== 0);
+            if (!this.cachedSortedEntries || this.cachedSortedEntries.length !== all.length) {
+                all.sort((a, b) => a.address - b.address);
+                this.cachedSortedEntries = all;
+            }
+            const sorted = this.cachedSortedEntries;
             const values = new Map();
-            // 1 字节组
-            const entries1 = entries.filter(e => e.byteSize === 1);
-            // 2 字节组
-            const entries2 = entries.filter(e => e.byteSize === 2);
-            // 4 字节组
-            const entries4 = entries.filter(e => e.byteSize === 4);
-            // 8 字节组（逐条读取）
-            const entries8 = entries.filter(e => e.byteSize === 8);
+            // 按 byteSize 分组（已排序，无需再 sort）
+            const entries1 = [];
+            const entries2 = [];
+            const entries4 = [];
+            const entries8 = [];
+            for (const e of sorted) {
+                if (e.byteSize === 1) {
+                    entries1.push(e);
+                }
+                else if (e.byteSize === 2) {
+                    entries2.push(e);
+                }
+                else if (e.byteSize === 4) {
+                    entries4.push(e);
+                }
+                else if (e.byteSize === 8) {
+                    entries8.push(e);
+                }
+            }
             // 批量读取连续地址的 1 字节变量
-            await this.batchReadTcl(tcl, entries1, 1, values);
+            if (entries1.length > 0) {
+                await this.batchReadTcl(tcl, entries1, 1, values);
+            }
             // 批量读取连续地址的 2 字节变量
-            await this.batchReadTcl(tcl, entries2, 2, values);
+            if (entries2.length > 0) {
+                await this.batchReadTcl(tcl, entries2, 2, values);
+            }
             // 批量读取连续地址的 4 字节变量
-            await this.batchReadTcl(tcl, entries4, 4, values);
+            if (entries4.length > 0) {
+                await this.batchReadTcl(tcl, entries4, 4, values);
+            }
             // 8 字节变量单独读（两个 32 位字）
             for (const entry of entries8) {
                 try {
@@ -427,6 +472,12 @@ class LiveWatchService {
             if (values.size > 0) {
                 // 仅在 Live 绘图模式下推数据到 dataBuffer（画波形）
                 if (this.livePlotting) {
+                    // 确保所有读取到的变量在 dataBuffer 中都有对应通道（兼容 setTracked 未及时创建的场景）
+                    for (const name of values.keys()) {
+                        if (!this.dataBuffer.getChannels().some((c) => c.name === name)) {
+                            this.dataBuffer.addChannel(name);
+                        }
+                    }
                     const nowNs = process.hrtime.bigint();
                     this.dataBuffer.pushAll(values, nowNs);
                     this.sampleCount += 1;
@@ -448,12 +499,10 @@ class LiveWatchService {
      * 批量读取同一字节大小的变量。
      * 将连续地址合并为一条 TCL 命令，大幅减少 round-trip 次数。
      */
-    async batchReadTcl(client, entries, byteSize, outValues) {
-        if (entries.length === 0) {
+    async batchReadTcl(client, sorted, byteSize, outValues) {
+        if (sorted.length === 0) {
             return;
         }
-        // 按地址排序
-        const sorted = [...entries].sort((a, b) => a.address - b.address);
         const readFn = byteSize === 1
             ? (addr, cnt) => client.readMemory8(addr, cnt)
             : byteSize === 2

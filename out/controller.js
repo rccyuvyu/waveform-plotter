@@ -309,7 +309,7 @@ class WaveformController {
         this.state = {
             ...this.state,
             ...update,
-            liveWatchFrequency: clampInt(update.liveWatchFrequency ?? this.state.liveWatchFrequency, 1, 2000, 50),
+            liveWatchFrequency: clampInt(update.liveWatchFrequency ?? this.state.liveWatchFrequency, 1, 10000, 1000),
             telnetPort: clampInt(update.telnetPort ?? this.state.telnetPort, 1, 65535, 4444),
             rttPort: clampInt(update.rttPort ?? this.state.rttPort, 1, 65535, 9090),
             fontSize: clampInt(update.fontSize ?? this.state.fontSize, 8, 20, 12),
@@ -320,7 +320,7 @@ class WaveformController {
         this.scheduleSync(true);
     }
     async setFrequency(hz) {
-        this.state.liveWatchFrequency = clampInt(hz, 1, 10000, 50);
+        this.state.liveWatchFrequency = clampInt(hz, 1, 10000, 1000);
         this.persist();
         this.scheduleSync(true);
     }
@@ -865,7 +865,7 @@ class WaveformController {
                     address: entry ? `0x${entry.address.toString(16)}` : '',
                     hasChildren: nodeHasChildren,
                     expanded: expandedSet.has(name),
-                    selectable: depth > 0 && !nodeHasChildren,
+                    selectable: !nodeHasChildren,
                     checkState,
                     color: channel?.color ?? '',
                     isRoot: depth === 0

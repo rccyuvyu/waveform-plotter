@@ -5,7 +5,7 @@ exports.DEFAULT_STATE = {
     variableNames: [],
     trackedVariables: [],
     expandedNodes: [],
-    liveWatchFrequency: 50,
+    liveWatchFrequency: 1000,
     telnetPort: 4444,
     resolvedAddresses: {},
     dataSource: 'Telnet',

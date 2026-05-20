@@ -51,7 +51,7 @@
     recording: false,
     liveRunning: false,
     dataSource: 'Telnet',
-    frequencyHz: 50,
+    frequencyHz: 1000,
     displayMode: 'TIME',
     timeUnit: 'ms',
     fontSize: 12,
@@ -159,7 +159,7 @@
     ui.liveBtn.addEventListener('click', () => vscode.postMessage({ type: 'toggleLive' }));
     ui.sourceSel.addEventListener('change', () => vscode.postMessage({ type: 'dataSource', source: ui.sourceSel.value }));
     ui.freqInput.addEventListener('change', () => {
-      const freq = clampInt(ui.freqInput.value, 1, 10000, 50);
+      const freq = clampInt(ui.freqInput.value, 1, 10000, 1000);
       vscode.postMessage({ type: 'setFrequency', frequencyHz: freq });
     });
     ui.addBtn.addEventListener('click', addVarFromInput);
