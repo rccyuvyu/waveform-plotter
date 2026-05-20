@@ -186,25 +186,28 @@ class WaveformController {
             return;
         }
         const tracked = new Set(this.state.trackedVariables);
-        const targets = this.getTrackTargetNames(trimmed);
         const failedTargets = [];
-        for (const target of targets) {
-            if (checked) {
-                if (this.dataBuffer.getChannels().some((c) => c.name === target)) {
-                    tracked.add(target);
-                    continue;
-                }
-                const channel = this.dataBuffer.addChannel(target);
-                if (channel) {
-                    tracked.add(target);
-                }
-                else {
-                    failedTargets.push(target);
-                }
+        const addTarget = (target) => {
+            if (this.dataBuffer.getChannels().some((c) => c.name === target)) {
+                return true;
+            }
+            const channel = this.dataBuffer.addChannel(target);
+            if (channel) {
+                return true;
+            }
+            return false;
+        };
+        if (checked) {
+            // 只跟踪用户勾选的那一个变量，不自动跟踪其子成员
+            if (addTarget(trimmed)) {
+                tracked.add(trimmed);
             }
             else {
-                tracked.delete(target);
+                failedTargets.push(trimmed);
             }
+        }
+        else {
+            tracked.delete(trimmed);
         }
         if (failedTargets.length > 0) {
             const first = failedTargets[0];
@@ -333,13 +336,26 @@ class WaveformController {
             }
             return;
         }
-        if (this.liveWatchService.isRunning.value) {
+        if (this.liveWatchService.livePlotting) {
+            // 正在 Live 绘图 → 停止绘图（保持 TCL 读取，树仍显示值）
+            this.liveWatchService.livePlotting = false;
             this.suppressAutoLiveUntilNextSession = true;
-            await this.stopLiveWatch();
+            (0, logger_1.log)('Live plotting stopped');
         }
         else {
             this.suppressAutoLiveUntilNextSession = false;
-            await this.startLiveWatch();
+            if (!this.liveWatchService.isRunning.value) {
+                // 首次点击 Live：连接 TCL 并启动连续读取
+                await this.startLiveWatch();
+                (0, logger_1.log)('TCL connected, continuous reading started');
+            }
+            this.liveWatchService.livePlotting = true;
+            // 清空旧数据
+            this.dataBuffer.clearAll();
+            this.lastPushedDataVersion = -1;
+            this.lastPushedChannelSignature = '';
+            this.lastPushedTotalSamples = 0;
+            (0, logger_1.log)('Live plotting started');
         }
     }
     async stopAllLive() {
@@ -827,7 +843,8 @@ class WaveformController {
                 const nodeHasChildren = hasChildren.has(name);
                 const channel = this.dataBuffer.getChannels().find((c) => c.name === name);
                 const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
-                const valueText = this.getDisplayValueText(name, latest, entry?.dataType ?? hintedType)
+                const previewVal = this.liveWatchService.getLastReadValue(name);
+                const valueText = this.getDisplayValueText(name, latest ?? previewVal, entry?.dataType ?? hintedType)
                     || this.liveWatchService.getKnownDisplayValue(name)
                     || '';
                 const trackTargets = this.getTrackTargetNames(name);
@@ -866,16 +883,9 @@ class WaveformController {
             this.clearTrackedRuntimeState();
             return;
         }
-        for (const name of this.state.trackedVariables) {
-            this.dataBuffer.addChannel(name);
-        }
-        for (const [name, value] of Object.entries(this.state.resolvedAddresses ?? {})) {
-            const m = value.match(/^0x([0-9a-fA-F]+):(\w+)$/);
-            if (!m) {
-                continue;
-            }
-            this.liveWatchService.hydrateResolvedEntries({ [name]: value });
-        }
+        // 启动时清除旧持久化跟踪状态，用户需手动勾选需要跟踪的变量。
+        // 这是为了防止旧版本自动展开结构体占满通道导致无法添加新变量。
+        this.clearTrackedRuntimeState();
     }
     async loadState() {
         const saved = this.context.workspaceState.get(this.stateKey);
@@ -1059,7 +1069,7 @@ class WaveformController {
         }
         const liveRunning = this.state.dataSource === 'RTT'
             ? this.rttService.isRunning.value
-            : this.liveWatchService.isRunning.value;
+            : this.liveWatchService.livePlotting;
         return {
             bufferCapacity: this.dataBuffer.capacity,
             variables,
@@ -1088,10 +1098,22 @@ class WaveformController {
     }
     getDisplayValueText(name, latestBuffered, dataType) {
         if (latestBuffered !== undefined && Number.isFinite(latestBuffered)) {
+            if (dataType === 'ENUM') {
+                const enumName = this.liveWatchService.getEnumConstantName(name, latestBuffered);
+                if (enumName) {
+                    return enumName;
+                }
+            }
             return formatCompactValue(latestBuffered, dataType);
         }
         const preview = this.latestPreviewValues.get(name);
         if (preview !== undefined && Number.isFinite(preview)) {
+            if (dataType === 'ENUM') {
+                const enumName = this.liveWatchService.getEnumConstantName(name, preview);
+                if (enumName) {
+                    return enumName;
+                }
+            }
             return formatCompactValue(preview, dataType);
         }
         return '';
@@ -1283,6 +1305,9 @@ function compareWatchPaths(a, b) {
 function formatCompactValue(v, dataType) {
     if (!Number.isFinite(v)) {
         return 'NaN';
+    }
+    if (dataType === 'BOOL') {
+        return v !== 0 ? 'true' : 'false';
     }
     const prefix = dataType ? `(${dataType.toLowerCase()}) ` : '';
     const abs = Math.abs(v);

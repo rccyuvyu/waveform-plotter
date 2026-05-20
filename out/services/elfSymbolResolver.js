@@ -17,6 +17,8 @@ class ElfSymbolResolver {
         this.typeCache = new Map();
         this.compositeLeafCache = new Map();
         this.compositeTreeCache = new Map();
+        /** typeName → value → enum constant name */
+        this.enumConstantMaps = new Map();
         this.lastModified = 0;
     }
     async loadSymbols(elfPath) {
@@ -147,6 +149,9 @@ class ElfSymbolResolver {
         if (!dt) {
             return undefined;
         }
+        if (dt === 'ENUM') {
+            await this.resolveEnumConstants(symbolName);
+        }
         return { name, address: info.address, dataType: dt, byteSize: this.byteSize(dt) };
     }
     async resolveExpressionEntry(expression) {
@@ -169,6 +174,9 @@ class ElfSymbolResolver {
         const address = addressMatch ? Number.parseInt(addressMatch[1], 16) : Number.NaN;
         if (!dataType || !Number.isFinite(address)) {
             return undefined;
+        }
+        if (dataType === 'ENUM') {
+            await this.resolveEnumConstants(expression);
         }
         return {
             name: expression,
@@ -453,6 +461,7 @@ class ElfSymbolResolver {
         switch (dt) {
             case 'INT8':
             case 'UINT8':
+            case 'BOOL':
                 return 1;
             case 'INT16':
             case 'UINT16':
@@ -460,6 +469,7 @@ class ElfSymbolResolver {
             case 'INT32':
             case 'UINT32':
             case 'FLOAT':
+            case 'ENUM':
                 return 4;
             case 'DOUBLE':
                 return 8;
@@ -644,6 +654,79 @@ class ElfSymbolResolver {
                 resolve(undefined);
             });
         });
+    }
+    /**
+     * 解析枚举类型常量：运行 ptype（不带 /o）获取枚举常量名→值映射并缓存。
+     */
+    async resolveEnumConstants(symbolName) {
+        const gdb = await this.findGdbTool();
+        if (!gdb || !this.lastElfPath) {
+            return false;
+        }
+        return new Promise((resolve) => {
+            const args = [
+                '-q', '--batch', this.lastElfPath,
+                '-ex', 'set pagination off',
+                '-ex', `ptype ${symbolName}`
+            ];
+            const proc = (0, child_process_1.spawn)(gdb, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            const chunks = [];
+            const timeout = setTimeout(() => proc.kill('SIGKILL'), 10000);
+            proc.stdout.on('data', (buf) => chunks.push(buf));
+            proc.on('close', (code) => {
+                clearTimeout(timeout);
+                if (code !== 0) {
+                    resolve(false);
+                    return;
+                }
+                const out = Buffer.concat(chunks).toString('utf8');
+                const constants = this.parseEnumConstants(out);
+                if (constants.size === 0) {
+                    resolve(false);
+                    return;
+                }
+                // 从 ptype 输出中提取类型名作为缓存 key
+                const typeLine = out.match(/type\s*=\s*enum\s+(\S+)/);
+                const key = typeLine?.[1] ?? symbolName;
+                this.enumConstantMaps.set(key, constants);
+                resolve(true);
+            });
+            proc.on('error', () => { clearTimeout(timeout); resolve(false); });
+        });
+    }
+    /** 从 GDB ptype 输出中解析枚举常量：{ VAL_A = 0, VAL_B = 1, ... } */
+    parseEnumConstants(ptypeOutput) {
+        const map = new Map();
+        const braceStart = ptypeOutput.indexOf('{');
+        const braceEnd = ptypeOutput.lastIndexOf('}');
+        if (braceStart < 0 || braceEnd < 0) {
+            return map;
+        }
+        const body = ptypeOutput.substring(braceStart + 1, braceEnd);
+        let implicitValue = 0;
+        for (const entry of body.split(',')) {
+            const trimmed = entry.trim();
+            if (!trimmed) {
+                continue;
+            }
+            const explicitMatch = trimmed.match(/^(\w+)\s*=\s*(\d+)/);
+            if (explicitMatch) {
+                const val = Number.parseInt(explicitMatch[2], 10);
+                map.set(val, explicitMatch[1]);
+                implicitValue = val + 1;
+            }
+            else if (/^\w+$/.test(trimmed)) {
+                map.set(implicitValue, trimmed);
+                implicitValue++;
+            }
+        }
+        return map;
+    }
+    /** 根据原始类型文本和值查询枚举常量名，如 getEnumConstantName("enum MyEnum", 1) → "VAL_B" */
+    getEnumConstantName(typeText, value) {
+        const typeName = typeText.replace(/^enum\s+/, '').trim();
+        const constants = this.enumConstantMaps.get(typeName);
+        return constants?.get(value);
     }
     async runGdbExpressionInspect(gdbPath, elfPath, expression) {
         return new Promise((resolve) => {

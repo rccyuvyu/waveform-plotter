@@ -3,6 +3,8 @@ export type DisplayMode = 'TIME' | 'FFT';
 export type TimeUnit = 'ms' | 'us';
 
 export type DataType =
+  | 'BOOL'
+  | 'ENUM'
   | 'INT8'
   | 'UINT8'
   | 'INT16'
@@ -60,7 +62,7 @@ export const DEFAULT_STATE: PersistedState = {
   variableNames: [],
   trackedVariables: [],
   expandedNodes: [],
-  liveWatchFrequency: 50,
+  liveWatchFrequency: 1000,
   telnetPort: 4444,
   resolvedAddresses: {},
   dataSource: 'Telnet',

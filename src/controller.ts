@@ -171,23 +171,27 @@ export class WaveformController implements vscode.Disposable {
       return;
     }
     const tracked = new Set(this.state.trackedVariables);
-    const targets = this.getTrackTargetNames(trimmed);
     const failedTargets: string[] = [];
-    for (const target of targets) {
-      if (checked) {
-        if (this.dataBuffer.getChannels().some((c) => c.name === target)) {
-          tracked.add(target);
-          continue;
-        }
-        const channel = this.dataBuffer.addChannel(target);
-        if (channel) {
-          tracked.add(target);
-        } else {
-          failedTargets.push(target);
-        }
-      } else {
-        tracked.delete(target);
+    const addTarget = (target: string) => {
+      if (this.dataBuffer.getChannels().some((c) => c.name === target)) {
+        return true;
       }
+      const channel = this.dataBuffer.addChannel(target);
+      if (channel) {
+        return true;
+      }
+      return false;
+    };
+
+    if (checked) {
+      // 只跟踪用户勾选的那一个变量，不自动跟踪其子成员
+      if (addTarget(trimmed)) {
+        tracked.add(trimmed);
+      } else {
+        failedTargets.push(trimmed);
+      }
+    } else {
+      tracked.delete(trimmed);
     }
     if (failedTargets.length > 0) {
       const first = failedTargets[0];
@@ -303,7 +307,7 @@ export class WaveformController implements vscode.Disposable {
     this.state = {
       ...this.state,
       ...update,
-      liveWatchFrequency: clampInt(update.liveWatchFrequency ?? this.state.liveWatchFrequency, 1, 2000, 50),
+      liveWatchFrequency: clampInt(update.liveWatchFrequency ?? this.state.liveWatchFrequency, 1, 10000, 1000),
       telnetPort: clampInt(update.telnetPort ?? this.state.telnetPort, 1, 65535, 4444),
       rttPort: clampInt(update.rttPort ?? this.state.rttPort, 1, 65535, 9090),
       fontSize: clampInt(update.fontSize ?? this.state.fontSize, 8, 20, 12),
@@ -315,7 +319,7 @@ export class WaveformController implements vscode.Disposable {
   }
 
   async setFrequency(hz: number): Promise<void> {
-    this.state.liveWatchFrequency = clampInt(hz, 1, 10000, 50);
+    this.state.liveWatchFrequency = clampInt(hz, 1, 10000, 1000);
     this.persist();
     this.scheduleSync(true);
   }
@@ -332,12 +336,25 @@ export class WaveformController implements vscode.Disposable {
       return;
     }
 
-    if (this.liveWatchService.isRunning.value) {
+    if (this.liveWatchService.livePlotting) {
+      // 正在 Live 绘图 → 停止绘图（保持 TCL 读取，树仍显示值）
+      this.liveWatchService.livePlotting = false;
       this.suppressAutoLiveUntilNextSession = true;
-      await this.stopLiveWatch();
+      log('Live plotting stopped');
     } else {
       this.suppressAutoLiveUntilNextSession = false;
-      await this.startLiveWatch();
+      if (!this.liveWatchService.isRunning.value) {
+        // 首次点击 Live：连接 TCL 并启动连续读取
+        await this.startLiveWatch();
+        log('TCL connected, continuous reading started');
+      }
+      this.liveWatchService.livePlotting = true;
+      // 清空旧数据
+      this.dataBuffer.clearAll();
+      this.lastPushedDataVersion = -1;
+      this.lastPushedChannelSignature = '';
+      this.lastPushedTotalSamples = 0;
+      log('Live plotting started');
     }
   }
 
@@ -871,7 +888,8 @@ export class WaveformController implements vscode.Disposable {
         const nodeHasChildren = hasChildren.has(name);
         const channel = this.dataBuffer.getChannels().find((c) => c.name === name);
         const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
-        const valueText = this.getDisplayValueText(name, latest, entry?.dataType ?? hintedType)
+        const previewVal = this.liveWatchService.getLastReadValue(name);
+        const valueText = this.getDisplayValueText(name, latest ?? previewVal, entry?.dataType ?? hintedType)
           || this.liveWatchService.getKnownDisplayValue(name)
           || '';
         const trackTargets = this.getTrackTargetNames(name);
@@ -911,16 +929,9 @@ export class WaveformController implements vscode.Disposable {
       this.clearTrackedRuntimeState();
       return;
     }
-    for (const name of this.state.trackedVariables) {
-      this.dataBuffer.addChannel(name);
-    }
-    for (const [name, value] of Object.entries(this.state.resolvedAddresses ?? {})) {
-      const m = value.match(/^0x([0-9a-fA-F]+):(\w+)$/);
-      if (!m) {
-        continue;
-      }
-      this.liveWatchService.hydrateResolvedEntries({ [name]: value });
-    }
+    // 启动时清除旧持久化跟踪状态，用户需手动勾选需要跟踪的变量。
+    // 这是为了防止旧版本自动展开结构体占满通道导致无法添加新变量。
+    this.clearTrackedRuntimeState();
   }
 
   private async loadState(): Promise<void> {
@@ -1142,7 +1153,7 @@ export class WaveformController implements vscode.Disposable {
 
     const liveRunning = this.state.dataSource === 'RTT'
       ? this.rttService.isRunning.value
-      : this.liveWatchService.isRunning.value;
+      : this.liveWatchService.livePlotting;
 
     return {
       bufferCapacity: this.dataBuffer.capacity,
@@ -1173,10 +1184,18 @@ export class WaveformController implements vscode.Disposable {
 
   private getDisplayValueText(name: string, latestBuffered: number | undefined, dataType?: string): string {
     if (latestBuffered !== undefined && Number.isFinite(latestBuffered)) {
+      if (dataType === 'ENUM') {
+        const enumName = this.liveWatchService.getEnumConstantName(name, latestBuffered);
+        if (enumName) { return enumName; }
+      }
       return formatCompactValue(latestBuffered, dataType);
     }
     const preview = this.latestPreviewValues.get(name);
     if (preview !== undefined && Number.isFinite(preview)) {
+      if (dataType === 'ENUM') {
+        const enumName = this.liveWatchService.getEnumConstantName(name, preview);
+        if (enumName) { return enumName; }
+      }
       return formatCompactValue(preview, dataType);
     }
     return '';
@@ -1389,6 +1408,9 @@ function compareWatchPaths(a: string, b: string): number {
 function formatCompactValue(v: number, dataType?: string): string {
   if (!Number.isFinite(v)) {
     return 'NaN';
+  }
+  if (dataType === 'BOOL') {
+    return v !== 0 ? 'true' : 'false';
   }
   const prefix = dataType ? `(${dataType.toLowerCase()}) ` : '';
   const abs = Math.abs(v);

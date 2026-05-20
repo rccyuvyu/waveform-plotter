@@ -65,12 +65,21 @@ export function inferDataTypeFromTypeText(typeText: string, byteSize: number): D
     return undefined;
   }
 
+  const isEnum = /\benum\b/.test(lower);
+  const isBool = /\b(?:bool|_Bool)\b/.test(lower);
   const isFloat = /\bfloat\b/.test(lower);
-  const isDouble = /\bdouble\b/.test(lower);
-  const isUnsigned = /\bunsigned\b|\buint\d*_t\b|\bbool\b/.test(lower);
+  const isDouble = /\b(?:double|long\s+double)\b/.test(lower);
+  // 无符号类型：unsigned 关键字、uint*_t、size_t、指针（地址为无符号）
+  const isUnsigned = /\b(?:unsigned|size_t|wchar_t|char16_t|char32_t|uintptr_t)\b|\buint\d*_t\b/.test(lower) || /\*/.test(lower);
   const isExplicitSigned = /\bsigned\b|\bint\d*_t\b/.test(lower);
   const isCharLike = /\bchar\b|\bint8_t\b|\buint8_t\b/.test(lower);
 
+  if (isEnum) {
+    return 'ENUM';
+  }
+  if (isBool) {
+    return 'BOOL';
+  }
   if (isDouble) {
     return 'DOUBLE';
   }
@@ -90,9 +99,6 @@ export function inferDataTypeFromTypeText(typeText: string, byteSize: number): D
     return isUnsigned ? 'UINT32' : 'INT32';
   }
   if (byteSize === 8) {
-    if (isDouble) {
-      return 'DOUBLE';
-    }
     return isUnsigned ? 'UINT64' : 'INT64';
   }
   return undefined;
@@ -418,13 +424,13 @@ function joinCompositePath(basePath: string, childPath: string): string {
 
 function guessByteSize(typeText: string): number {
   const lower = typeText.toLowerCase();
-  if (/\bdouble\b/.test(lower)) {
+  if (/\b(?:long\s+long|int64_t|uint64_t|double|long\s+double)\b/.test(lower)) {
     return 8;
   }
   if (/\bfloat\b/.test(lower)) {
     return 4;
   }
-  if (/\b(?:u?int8_t|char|bool)\b/.test(lower)) {
+  if (/\b(?:u?int8_t|char|bool|_Bool)\b/.test(lower)) {
     return 1;
   }
   if (/\b(?:u?int16_t|short)\b/.test(lower)) {

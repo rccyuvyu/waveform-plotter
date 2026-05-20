@@ -16,6 +16,10 @@ class LiveWatchService {
         this.onData = onData;
         this.isRunning = { value: false };
         this.elfResolver = new elfSymbolResolver_1.ElfSymbolResolver();
+        /** 是否正在绘制波形（Live 模式下推数据到 dataBuffer） */
+        this.livePlotting = false;
+        /** 最近一次读取的所有变量值，用于树显示 */
+        this.lastReadValues = new Map();
         this.sampleCount = 0;
         this.sampleRateMeter = new sampleRateMeter_1.SampleRateMeter();
         this.watchEntries = new Map();
@@ -50,6 +54,21 @@ class LiveWatchService {
     }
     getKnownDisplayValue(name) {
         return this.knownDisplayValues.get(name);
+    }
+    getLastReadValue(name) {
+        return this.lastReadValues.get(name);
+    }
+    getEnumConstantName(name, value) {
+        // 优先通过声明的类型文本查找
+        const declaredType = this.knownDeclaredTypes.get(name);
+        if (declaredType) {
+            const result = this.elfResolver.getEnumConstantName(declaredType, value);
+            if (result) {
+                return result;
+            }
+        }
+        // 回退：直接用变量名查找（简单枚举变量通过 buildEntry 已缓存）
+        return this.elfResolver.getEnumConstantName(name, value);
     }
     clearResolvedEntries() {
         this.watchEntries.clear();
@@ -371,42 +390,114 @@ class LiveWatchService {
         this.sampleBusy = true;
         try {
             const tcl = this.client;
-            const entries = [...this.watchEntries.values()];
+            const entries = [...this.watchEntries.values()].filter(e => e.address !== 0);
             const values = new Map();
-            for (const entry of entries) {
-                if (entry.address === 0) {
-                    continue;
-                }
+            // 1 字节组
+            const entries1 = entries.filter(e => e.byteSize === 1);
+            // 2 字节组
+            const entries2 = entries.filter(e => e.byteSize === 2);
+            // 4 字节组
+            const entries4 = entries.filter(e => e.byteSize === 4);
+            // 8 字节组（逐条读取）
+            const entries8 = entries.filter(e => e.byteSize === 8);
+            // 批量读取连续地址的 1 字节变量
+            await this.batchReadTcl(tcl, entries1, 1, values);
+            // 批量读取连续地址的 2 字节变量
+            await this.batchReadTcl(tcl, entries2, 2, values);
+            // 批量读取连续地址的 4 字节变量
+            await this.batchReadTcl(tcl, entries4, 4, values);
+            // 8 字节变量单独读（两个 32 位字）
+            for (const entry of entries8) {
                 try {
-                    const interpreted = await this.readViaTcl(tcl, entry);
-                    if (interpreted !== undefined && Number.isFinite(interpreted)) {
-                        values.set(entry.name, interpreted);
+                    const rawWords = await tcl.readMemory32(entry.address, 2);
+                    if (rawWords.length >= 2) {
+                        const raw = (BigInt(rawWords[1] >>> 0) << 32n) | BigInt(rawWords[0] >>> 0);
+                        const interpreted = interpretBytes(raw, entry.dataType);
+                        if (interpreted !== undefined && Number.isFinite(interpreted)) {
+                            values.set(entry.name, interpreted);
+                        }
                     }
                 }
-                catch {
-                    // TCL 读失败跳过
-                }
+                catch { /* skip */ }
+            }
+            // 始终更新最后读取的值（用于树显示）
+            for (const [name, value] of values) {
+                this.lastReadValues.set(name, value);
             }
             if (values.size > 0) {
-                for (const name of values.keys()) {
-                    if (!this.dataBuffer.getChannels().some((c) => c.name === name)) {
-                        this.dataBuffer.addChannel(name);
+                // 仅在 Live 绘图模式下推数据到 dataBuffer（画波形）
+                if (this.livePlotting) {
+                    const nowNs = process.hrtime.bigint();
+                    this.dataBuffer.pushAll(values, nowNs);
+                    this.sampleCount += 1;
+                    this.sampleRateMeter.mark(nowNs);
+                    this.lastError = undefined;
+                    if (this.sampleCount <= 3) {
+                        const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
+                        console.log(`[waveform-plotter] sampleViaTcl #${this.sampleCount}: ${sampleStr}`);
                     }
                 }
-                const nowNs = process.hrtime.bigint();
-                this.dataBuffer.pushAll(values, nowNs);
-                this.sampleCount += 1;
-                this.sampleRateMeter.mark(nowNs);
-                this.lastError = undefined;
-                if (this.sampleCount <= 3) {
-                    const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
-                    console.log(`[waveform-plotter] sampleViaTcl #${this.sampleCount}: ${sampleStr}`);
-                }
-                this.onData();
+                this.onData(); // 通知 controller 更新显示
             }
         }
         finally {
             this.sampleBusy = false;
+        }
+    }
+    /**
+     * 批量读取同一字节大小的变量。
+     * 将连续地址合并为一条 TCL 命令，大幅减少 round-trip 次数。
+     */
+    async batchReadTcl(client, entries, byteSize, outValues) {
+        if (entries.length === 0) {
+            return;
+        }
+        // 按地址排序
+        const sorted = [...entries].sort((a, b) => a.address - b.address);
+        const readFn = byteSize === 1
+            ? (addr, cnt) => client.readMemory8(addr, cnt)
+            : byteSize === 2
+                ? (addr, cnt) => client.readMemory16(addr, cnt)
+                : (addr, cnt) => client.readMemory32(addr, cnt);
+        let i = 0;
+        while (i < sorted.length) {
+            // 找到连续地址范围
+            let j = i + 1;
+            while (j < sorted.length) {
+                const expected = sorted[j - 1].address + byteSize;
+                if (sorted[j].address !== expected) {
+                    break;
+                }
+                j++;
+            }
+            const batch = sorted.slice(i, j);
+            const startAddr = batch[0].address;
+            const count = batch.length;
+            try {
+                const rawValues = await readFn(startAddr, count);
+                for (let k = 0; k < batch.length; k++) {
+                    const raw = BigInt(rawValues[k] ?? 0);
+                    const interpreted = interpretBytes(raw, batch[k].dataType);
+                    if (interpreted !== undefined && Number.isFinite(interpreted)) {
+                        outValues.set(batch[k].name, interpreted);
+                    }
+                }
+            }
+            catch {
+                // 批量读失败时回退到逐条读取
+                for (const entry of batch) {
+                    try {
+                        const single = await readFn(entry.address, 1);
+                        const raw = BigInt(single[0] ?? 0);
+                        const interpreted = interpretBytes(raw, entry.dataType);
+                        if (interpreted !== undefined && Number.isFinite(interpreted)) {
+                            outValues.set(entry.name, interpreted);
+                        }
+                    }
+                    catch { /* skip */ }
+                }
+            }
+            i = j;
         }
     }
     /** 根据数据类型构建 DAP evaluate 表达式 */
@@ -417,6 +508,7 @@ class LiveWatchService {
                 return `*(float*)(${addr})`;
             case 'DOUBLE':
                 return `*(double*)(${addr})`;
+            case 'BOOL':
             case 'INT8':
                 return `*(int8_t*)(${addr})`;
             case 'UINT8':
@@ -427,6 +519,7 @@ class LiveWatchService {
                 return `*(uint16_t*)(${addr})`;
             case 'INT32':
                 return `*(int32_t*)(${addr})`;
+            case 'ENUM':
             case 'UINT32':
                 return `*(uint32_t*)(${addr})`;
             case 'INT64':
@@ -480,6 +573,7 @@ class LiveWatchService {
             return null;
         }
         switch (dataType) {
+            case 'BOOL':
             case 'UINT8':
                 return clampInt(num, 0, 255);
             case 'INT8':
@@ -488,6 +582,8 @@ class LiveWatchService {
                 return clampInt(num, 0, 65535);
             case 'INT16':
                 return clampInt(num, -32768, 32767) & 0xFFFF;
+            case 'ENUM':
+                return clampUint(num, 0, 0xFFFFFFFF);
             case 'UINT32':
                 return clampUint(num, 0, 0xFFFFFFFF);
             case 'INT32':
@@ -509,12 +605,14 @@ class LiveWatchService {
     buildTelnetWriteCommand(entry, value) {
         const addr = `0x${entry.address.toString(16)}`;
         switch (entry.dataType) {
+            case 'BOOL':
             case 'INT8':
             case 'UINT8':
                 return [`mwb ${addr} ${value}`];
             case 'INT16':
             case 'UINT16':
                 return [`mwh ${addr} ${value}`];
+            case 'ENUM':
             case 'INT32':
             case 'UINT32':
                 return [`mww ${addr} ${value}`];
@@ -1167,6 +1265,7 @@ class LiveWatchService {
     }
     async readViaTcl(client, entry) {
         switch (entry.dataType) {
+            case 'BOOL':
             case 'INT8':
             case 'UINT8': {
                 const values = await client.readMemory8(entry.address, 1);
@@ -1177,6 +1276,7 @@ class LiveWatchService {
                 const values = await client.readMemory16(entry.address, 1);
                 return interpretBytes(BigInt(values[0] ?? 0), entry.dataType);
             }
+            case 'ENUM':
             case 'INT32':
             case 'UINT32':
             case 'FLOAT': {
@@ -1197,6 +1297,7 @@ class LiveWatchService {
     }
     async writeViaTcl(client, entry, value) {
         switch (entry.dataType) {
+            case 'BOOL':
             case 'INT8':
             case 'UINT8':
                 await client.writeMemory8(entry.address, value);
@@ -1205,6 +1306,7 @@ class LiveWatchService {
             case 'UINT16':
                 await client.writeMemory16(entry.address, value);
                 return;
+            case 'ENUM':
             case 'INT32':
             case 'UINT32':
                 await client.writeMemory32(entry.address, value);
@@ -1373,12 +1475,14 @@ async function sleep(ms) {
 function buildTelnetReadCommand(entry) {
     const addr = `0x${entry.address.toString(16)}`;
     switch (entry.dataType) {
+        case 'BOOL':
         case 'INT8':
         case 'UINT8':
             return `mdb ${addr} 1`;
         case 'INT16':
         case 'UINT16':
             return `mdh ${addr} 1`;
+        case 'ENUM':
         case 'INT32':
         case 'UINT32':
         case 'FLOAT':
@@ -1426,6 +1530,8 @@ function interpretBytes(rawValue, dataType) {
     const buf = new ArrayBuffer(8);
     const view = new DataView(buf);
     switch (dataType) {
+        case 'BOOL':
+            return Number(rawValue !== 0n ? 1 : 0);
         case 'UINT8':
             return Number(rawValue & 0xffn);
         case 'INT8': {
@@ -1438,6 +1544,7 @@ function interpretBytes(rawValue, dataType) {
             const v = Number(rawValue & 0xffffn);
             return v > 0x7fff ? v - 0x10000 : v;
         }
+        case 'ENUM':
         case 'UINT32':
             return Number(rawValue & 0xffffffffn);
         case 'INT32': {
@@ -1771,12 +1878,14 @@ function joinCompositePath(basePath, childPath) {
 }
 function byteSize(dataType) {
     switch (dataType) {
+        case 'BOOL':
         case 'INT8':
         case 'UINT8':
             return 1;
         case 'INT16':
         case 'UINT16':
             return 2;
+        case 'ENUM':
         case 'INT32':
         case 'UINT32':
         case 'FLOAT':
