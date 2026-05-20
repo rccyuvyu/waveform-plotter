@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "OpenOCD: Debug",
+            "cwd": "${workspaceFolder}",
+            "executable": "${command:cmake.getLaunchTargetPath}",
+            "request": "launch",
+            //"request": "attac",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "configFiles": [
+                "openocd.cfg",
+            ],
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 20
+            },
+            "preLaunchTask": "CMake: build"
+        }
+    ]
+}

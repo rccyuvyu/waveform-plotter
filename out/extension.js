@@ -38,8 +38,11 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const controller_1 = require("./controller");
 const panel_1 = require("./ui/panel");
+const logger_1 = require("./services/logger");
 let controller;
 async function activate(context) {
+    (0, logger_1.activateLogger)(context);
+    (0, logger_1.log)('Extension activating...');
     const viewProvider = new panel_1.WaveformViewProvider(context);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider(panel_1.WaveformViewProvider.viewType, viewProvider));
     controller = new controller_1.WaveformController(context, viewProvider);

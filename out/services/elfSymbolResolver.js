@@ -7,11 +7,16 @@ exports.ElfSymbolResolver = void 0;
 const child_process_1 = require("child_process");
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
+const compositeLayout_1 = require("./compositeLayout");
+const gdbMiTreeResolver_1 = require("./gdbMiTreeResolver");
+const watchTreeParser_1 = require("./watchTreeParser");
 class ElfSymbolResolver {
     constructor() {
         this.symbolCache = new Map();
         this.shortNameIndex = new Map();
         this.typeCache = new Map();
+        this.compositeLeafCache = new Map();
+        this.compositeTreeCache = new Map();
         this.lastModified = 0;
     }
     async loadSymbols(elfPath) {
@@ -33,6 +38,8 @@ class ElfSymbolResolver {
         this.symbolCache.clear();
         this.shortNameIndex.clear();
         this.typeCache.clear();
+        this.compositeLeafCache.clear();
+        this.compositeTreeCache.clear();
         this.parseNmOutput(output);
         this.buildShortNameIndex();
         this.lastElfPath = elfPath;
@@ -41,10 +48,82 @@ class ElfSymbolResolver {
     }
     async resolveVariable(varName) {
         const match = this.findSymbol(varName);
-        if (!match) {
+        if (match) {
+            return this.buildEntry(varName, match);
+        }
+        return this.resolveExpressionEntry(varName);
+    }
+    async resolveCompositeLeafPaths(varName) {
+        const infos = await this.resolveCompositeLeafInfos(varName);
+        return infos.map((info) => info.path);
+    }
+    async resolveCompositeLeafInfos(varName) {
+        const tree = await this.resolveCompositeWatchTree(varName);
+        if (!tree) {
+            return [];
+        }
+        return (0, watchTreeParser_1.flattenParsedWatchLeaves)(varName, tree).map((leaf) => ({
+            path: leaf.fullName === varName ? '' : leaf.fullName.slice(varName.length + 1),
+            typeText: leaf.declaredTypeText,
+            byteSize: leaf.byteSize
+        })).filter((leaf) => !!leaf.path);
+    }
+    async resolveCompositeWatchTree(varName) {
+        if (!this.lastElfPath || !fs_1.default.existsSync(this.lastElfPath)) {
             return undefined;
         }
-        return this.buildEntry(varName, match);
+        const match = this.findSymbol(varName);
+        const expr = match?.symbolName ?? varName;
+        const cacheKey = `${this.lastElfPath}:${this.lastModified}:tree:${expr}`;
+        if (this.compositeTreeCache.has(cacheKey)) {
+            return this.cloneParsedWatchNode(this.compositeTreeCache.get(cacheKey) ?? undefined);
+        }
+        const gdb = await this.findGdbTool();
+        if (!gdb) {
+            return undefined;
+        }
+        // 优先使用 GDB MI 方式：spawn("gdb", ["--interpreter=mi2", "-q", "-nx", elfPath])
+        // 此方式只打开 ELF 文件读取 DWARF 调试信息，不连接任何远程目标，不影响调试器
+        try {
+            const miResolver = new gdbMiTreeResolver_1.GdbMiTreeResolver(gdb, this.lastElfPath);
+            const miTree = await miResolver.resolve(expr);
+            if (miTree) {
+                this.compositeTreeCache.set(cacheKey, this.cloneParsedWatchNode(miTree) ?? null);
+                return this.cloneParsedWatchNode(miTree);
+            }
+        }
+        catch {
+            // Fall back to ptype-based resolution below.
+        }
+        const layoutText = await this.runGdbPtype(gdb, this.lastElfPath, expr);
+        if (!layoutText) {
+            return undefined;
+        }
+        const root = (0, watchTreeParser_1.parsePtypeWatchTree)(layoutText, expr);
+        if (!root) {
+            return undefined;
+        }
+        // ptype /o 对继承类表达式返回空体，检测继承信息并解析基类类型
+        if (root.children.length === 0) {
+            const headerMatch = layoutText.match(/type\s*=\s*(class|struct|union)\s+(.+?)\s*\{/);
+            if (headerMatch) {
+                const typeText = `${headerMatch[1]} ${headerMatch[2]}`;
+                if (hasInheritance(typeText)) {
+                    const baseName = extractBaseTypeName(typeText);
+                    if (baseName) {
+                        const baseTree = await this.resolveCompositeTypeTreeForElf(gdb, this.lastElfPath, baseName, expr, new Set());
+                        if (baseTree && baseTree.children.length > 0) {
+                            root.children = baseTree.children;
+                        }
+                    }
+                }
+            }
+        }
+        await this.hydrateParsedWatchTreeForElf(gdb, this.lastElfPath, root, new Set());
+        // ptype /o 解析的节点不含地址，通过 GDB 批量解析所有叶节点的地址
+        await this.resolvePtypeLeafAddresses(gdb, this.lastElfPath, root);
+        this.compositeTreeCache.set(cacheKey, this.cloneParsedWatchNode(root) ?? null);
+        return this.cloneParsedWatchNode(root);
     }
     findSymbol(varName) {
         const direct = this.symbolCache.get(varName);
@@ -70,6 +149,100 @@ class ElfSymbolResolver {
         }
         return { name, address: info.address, dataType: dt, byteSize: this.byteSize(dt) };
     }
+    async resolveExpressionEntry(expression) {
+        if (!this.lastElfPath || !fs_1.default.existsSync(this.lastElfPath)) {
+            return undefined;
+        }
+        const gdb = await this.findGdbTool();
+        if (!gdb) {
+            return undefined;
+        }
+        const output = await this.runGdbExpressionInspect(gdb, this.lastElfPath, expression);
+        if (!output) {
+            return undefined;
+        }
+        const typeMatch = output.match(/type\s*=\s*(.+)/i);
+        const sizeMatch = output.match(/\$\d+\s*=\s*(\d+)/);
+        const addressMatch = output.match(/\$\d+\s*=\s*0x([0-9a-fA-F]+)/);
+        const size = Number.parseInt(sizeMatch?.[1] ?? '', 10);
+        const dataType = (0, compositeLayout_1.inferDataTypeFromTypeText)(typeMatch?.[1]?.trim() ?? '', Number.isFinite(size) ? size : 0);
+        const address = addressMatch ? Number.parseInt(addressMatch[1], 16) : Number.NaN;
+        if (!dataType || !Number.isFinite(address)) {
+            return undefined;
+        }
+        return {
+            name: expression,
+            address,
+            dataType,
+            byteSize: this.byteSize(dataType)
+        };
+    }
+    async resolveExpressionTypeText(gdbPath, elfPath, expression) {
+        const output = await this.runGdbWhatis(gdbPath, elfPath, expression);
+        const typeMatch = output?.match(/type\s*=\s*(.+)/i);
+        return typeMatch?.[1]?.trim();
+    }
+    async resolveCompositeLeafInfosForType(gdbPath, elfPath, typeText, seenTypes) {
+        const normalizedType = normalizeTypeName(typeText);
+        if (!normalizedType || seenTypes.has(normalizedType)) {
+            return [];
+        }
+        seenTypes.add(normalizedType);
+        const output = await this.runGdbPtype(gdbPath, elfPath, normalizedType);
+        if (!output) {
+            return [];
+        }
+        const directFields = (0, compositeLayout_1.parseCompositeFieldInfos)(output);
+        if (directFields.length === 0) {
+            return dedupeLeafInfos((0, compositeLayout_1.parseCompositeLeafInfos)(output));
+        }
+        const leaves = [];
+        for (const field of directFields) {
+            const expanded = await this.expandFieldInfos(gdbPath, elfPath, field, seenTypes);
+            if (expanded.length > 0) {
+                leaves.push(...expanded);
+            }
+            else {
+                const elementPaths = expandFieldElementPaths(field);
+                const elementSize = computeElementByteSize(field);
+                const dataType = (0, compositeLayout_1.inferDataTypeFromTypeText)(field.typeText, elementSize);
+                if (!dataType) {
+                    continue;
+                }
+                for (const path of elementPaths) {
+                    leaves.push({
+                        path,
+                        typeText: field.typeText,
+                        byteSize: elementSize
+                    });
+                }
+            }
+        }
+        return dedupeLeafInfos(leaves);
+    }
+    async expandFieldInfos(gdbPath, elfPath, field, seenTypes) {
+        const nestedLeaves = await this.resolveCompositeLeafInfosForType(gdbPath, elfPath, field.typeText, new Set(seenTypes));
+        if (nestedLeaves.length === 0) {
+            return [];
+        }
+        const prefixes = expandFieldElementPaths(field);
+        const expanded = [];
+        for (const prefix of prefixes) {
+            for (const leaf of nestedLeaves) {
+                expanded.push({
+                    path: joinCompositePath(prefix, leaf.path),
+                    typeText: leaf.typeText,
+                    byteSize: leaf.byteSize
+                });
+            }
+        }
+        return expanded;
+    }
+    /** 根据 nm 输出判断符号大小。返回 undefined 表示未找到符号（可能为表达式）。 */
+    getSymbolByteSize(varName) {
+        const match = this.findSymbol(varName);
+        return match ? match.info.size : undefined;
+    }
     getSymbolCount() {
         return this.symbolCache.size;
     }
@@ -80,8 +253,155 @@ class ElfSymbolResolver {
         this.symbolCache.clear();
         this.shortNameIndex.clear();
         this.typeCache.clear();
+        this.compositeLeafCache.clear();
+        this.compositeTreeCache.clear();
         this.lastElfPath = undefined;
         this.lastModified = 0;
+    }
+    async hydrateParsedWatchTreeForElf(gdbPath, elfPath, node, seenTypes) {
+        for (const child of node.children) {
+            if (child.children.length > 0) {
+                await this.hydrateParsedWatchTreeForElf(gdbPath, elfPath, child, new Set(seenTypes));
+                continue;
+            }
+            const expanded = await this.resolveCompositeTypeTreeForElf(gdbPath, elfPath, child.declaredTypeText, child.expression, new Set(seenTypes));
+            if (expanded && expanded.children.length > 0) {
+                child.children = expanded.children;
+                child.byteSize = expanded.byteSize || child.byteSize;
+                await this.hydrateParsedWatchTreeForElf(gdbPath, elfPath, child, new Set(seenTypes));
+                continue;
+            }
+            // 处理继承类：通过 GDB 表达式探测基类数组成员
+            if (hasInheritance(child.declaredTypeText) && child.byteSize > 0) {
+                await this.hydrateInheritedLeaf(gdbPath, elfPath, child);
+            }
+        }
+    }
+    /** 对 ptype 解析的树中所有叶节点，通过 GDB 批量解析地址并回填到节点上 */
+    async resolvePtypeLeafAddresses(gdbPath, elfPath, root) {
+        // 收集所有叶节点的表达式
+        const leafNodes = [];
+        const walk = (node) => {
+            if (node.children.length === 0 && node.expression) {
+                leafNodes.push(node);
+                return;
+            }
+            for (const child of node.children) {
+                if (child.children.length === 0 && child.expression) {
+                    leafNodes.push(child);
+                }
+                else {
+                    walk(child);
+                }
+            }
+        };
+        walk(root);
+        if (leafNodes.length === 0) {
+            return;
+        }
+        // 用一个 GDB 批处理调用同时获取所有叶节点的地址
+        // 用 GDB batch 模式执行多个 print/x &(expr) 命令
+        const args = ['-q', '--batch', elfPath, '-ex', 'set pagination off'];
+        for (const leaf of leafNodes) {
+            args.push('-ex', `print/x (unsigned long)&(${leaf.expression})`);
+        }
+        const output = await this.runGdbCapture(gdbPath, args);
+        if (!output) {
+            return;
+        }
+        // 解析输出：每行格式 $N = 0xADDRESS
+        const addrMatches = [...output.matchAll(/\$(\d+)\s*=\s*0x([0-9a-fA-F]+)/g)];
+        if (addrMatches.length === 0) {
+            return;
+        }
+        // GDB 分配变量号从 $1 开始，按 -ex 顺序递增
+        for (let i = 0; i < Math.min(addrMatches.length, leafNodes.length); i += 1) {
+            const addr = Number.parseInt(addrMatches[i][2], 16);
+            if (Number.isFinite(addr) && addr > 0) {
+                leafNodes[i].address = addr;
+            }
+        }
+    }
+    async hydrateInheritedLeaf(gdbPath, elfPath, node) {
+        // 先用 ptype 获取完整成员列表（含继承成员），解析出所有基类数组字段
+        const ptypeOutput = await this.runGdbPtype(gdbPath, elfPath, node.expression);
+        if (!ptypeOutput) {
+            return;
+        }
+        const flatMembers = parseFlatInheritedMembers(ptypeOutput);
+        for (const member of flatMembers) {
+            if (!/^float\s/.test(member.type) || member.arrayDims.length === 0) {
+                continue;
+            }
+            const totalCount = member.arrayDims.reduce((a, d) => a * d, 1);
+            if (totalCount < 1 || totalCount > 128) {
+                continue;
+            }
+            const elemSize = member.byteSize / totalCount;
+            if (elemSize < 1) {
+                continue;
+            }
+            const memberExpr = `${node.expression}.${member.name}`;
+            const fieldNode = {
+                name: member.name,
+                relativePath: joinCompositePath(node.relativePath, member.name),
+                expression: memberExpr,
+                declaredTypeText: member.type,
+                byteSize: member.byteSize,
+                children: []
+            };
+            for (let i = 0; i < totalCount; i += 1) {
+                fieldNode.children.push({
+                    name: `[${i}]`,
+                    relativePath: `${fieldNode.relativePath}[${i}]`,
+                    expression: `(${memberExpr})[${i}]`,
+                    declaredTypeText: /double\b/i.test(member.type) ? 'double' : 'float',
+                    byteSize: elemSize,
+                    children: []
+                });
+            }
+            node.children.push(fieldNode);
+            return;
+        }
+    }
+    async resolveCompositeTypeTreeForElf(gdbPath, elfPath, typeText, expression, seenTypes) {
+        const normalizedType = normalizeTypeName(typeText);
+        if (!normalizedType || seenTypes.has(normalizedType)) {
+            return undefined;
+        }
+        seenTypes.add(normalizedType);
+        for (const candidate of buildCompositeTypeCandidates(normalizedType)) {
+            const layoutText = await this.runGdbPtype(gdbPath, elfPath, candidate);
+            if (!layoutText) {
+                continue;
+            }
+            const parsed = (0, watchTreeParser_1.parsePtypeWatchTree)(layoutText, expression);
+            if (parsed) {
+                // 如果解析结果没有子成员，且类型有基类，尝试解析基类的成员
+                // 使用原始 typeText（未标准化）以保留继承信息供 extractBaseTypeName 提取基类名
+                if (parsed.children.length === 0) {
+                    const baseName = extractBaseTypeName(typeText);
+                    if (baseName && !seenTypes.has(baseName)) {
+                        seenTypes.add(baseName);
+                        const baseResult = await this.resolveCompositeTypeTreeForElf(gdbPath, elfPath, baseName, expression, seenTypes);
+                        if (baseResult && baseResult.children.length > 0) {
+                            parsed.children = baseResult.children;
+                        }
+                    }
+                }
+                return parsed;
+            }
+        }
+        return undefined;
+    }
+    cloneParsedWatchNode(node) {
+        if (!node) {
+            return undefined;
+        }
+        return {
+            ...node,
+            children: node.children.map((child) => this.cloneParsedWatchNode(child))
+        };
     }
     parseNmOutput(output) {
         const withSize = /^([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([A-Za-z])\s+(\S+)$/gm;
@@ -125,8 +445,6 @@ class ElfSymbolResolver {
                 return 'INT16';
             case 4:
                 return 'INT32';
-            case 8:
-                return 'DOUBLE';
             default:
                 return undefined;
         }
@@ -144,6 +462,9 @@ class ElfSymbolResolver {
             case 'FLOAT':
                 return 4;
             case 'DOUBLE':
+                return 8;
+            case 'INT64':
+            case 'UINT64':
                 return 8;
         }
     }
@@ -185,14 +506,17 @@ class ElfSymbolResolver {
         }
         const output = await this.runGdbInspect(gdb, this.lastElfPath, symbolName);
         if (!output) {
-            this.typeCache.set(cacheKey, null);
             return undefined;
         }
         const whatisMatch = output.match(/type\s*=\s*(.+)/i);
         const sizeMatch = output.match(/\$\d+\s*=\s*(\d+)/);
-        const dataType = inferDataType(whatisMatch?.[1]?.trim() ?? '', sizeMatch?.[1] ?? String(fallbackSize));
-        this.typeCache.set(cacheKey, dataType ?? null);
-        return dataType ?? undefined;
+        const size = Number.parseInt(sizeMatch?.[1] ?? String(fallbackSize), 10);
+        const dataType = (0, compositeLayout_1.inferDataTypeFromTypeText)(whatisMatch?.[1]?.trim() ?? '', Number.isFinite(size) ? size : fallbackSize);
+        if (dataType) {
+            this.typeCache.set(cacheKey, dataType);
+            return dataType;
+        }
+        return undefined;
     }
     async runGdbInspect(gdbPath, elfPath, symbolName) {
         return new Promise((resolve) => {
@@ -229,11 +553,139 @@ class ElfSymbolResolver {
             });
         });
     }
+    async runGdbWhatis(gdbPath, elfPath, expression) {
+        return new Promise((resolve) => {
+            const args = [
+                '-q',
+                '--batch',
+                elfPath,
+                '-ex',
+                'set pagination off',
+                '-ex',
+                `whatis (${expression})`
+            ];
+            const proc = (0, child_process_1.spawn)(gdbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            const stdoutChunks = [];
+            const timeout = setTimeout(() => {
+                proc.kill('SIGKILL');
+            }, 10000);
+            proc.stdout.on('data', (buf) => stdoutChunks.push(buf));
+            proc.on('close', (code) => {
+                clearTimeout(timeout);
+                if (code === 0) {
+                    resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+                    return;
+                }
+                resolve(undefined);
+            });
+            proc.on('error', () => {
+                clearTimeout(timeout);
+                resolve(undefined);
+            });
+        });
+    }
+    /**
+     * 运行 GDB batch 命令并捕获 stdout 输出。
+     * @param gdbPath GDB 工具路径
+     * @param args GDB 命令行参数（不含程序名），如 ['-q', '--batch', elfPath, '-ex', ...]
+     */
+    async runGdbCapture(gdbPath, args) {
+        if (!gdbPath || !args.length) {
+            return undefined;
+        }
+        return new Promise((resolve) => {
+            const proc = (0, child_process_1.spawn)(gdbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            const stdoutChunks = [];
+            const timeout = setTimeout(() => {
+                proc.kill('SIGKILL');
+            }, 10000);
+            proc.stdout.on('data', (buf) => stdoutChunks.push(buf));
+            proc.on('close', (code) => {
+                clearTimeout(timeout);
+                if (code === 0) {
+                    resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+                    return;
+                }
+                resolve(undefined);
+            });
+            proc.on('error', () => {
+                clearTimeout(timeout);
+                resolve(undefined);
+            });
+        });
+    }
+    async runGdbPtype(gdbPath, elfPath, symbolName) {
+        return new Promise((resolve) => {
+            const args = [
+                '-q',
+                '--batch',
+                elfPath,
+                '-ex',
+                'set pagination off',
+                '-ex',
+                `ptype /o ${symbolName}`
+            ];
+            const proc = (0, child_process_1.spawn)(gdbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            const stdoutChunks = [];
+            const timeout = setTimeout(() => {
+                proc.kill('SIGKILL');
+            }, 10000);
+            proc.stdout.on('data', (buf) => stdoutChunks.push(buf));
+            proc.on('close', (code) => {
+                clearTimeout(timeout);
+                if (code === 0) {
+                    resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+                    return;
+                }
+                resolve(undefined);
+            });
+            proc.on('error', () => {
+                clearTimeout(timeout);
+                resolve(undefined);
+            });
+        });
+    }
+    async runGdbExpressionInspect(gdbPath, elfPath, expression) {
+        return new Promise((resolve) => {
+            const args = [
+                '-q',
+                '--batch',
+                elfPath,
+                '-ex',
+                'set pagination off',
+                '-ex',
+                `whatis (${expression})`,
+                '-ex',
+                `print (int)sizeof(${expression})`,
+                '-ex',
+                `print/x (unsigned long)&(${expression})`
+            ];
+            const proc = (0, child_process_1.spawn)(gdbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            const stdoutChunks = [];
+            const timeout = setTimeout(() => {
+                proc.kill('SIGKILL');
+            }, 10000);
+            proc.stdout.on('data', (buf) => stdoutChunks.push(buf));
+            proc.on('close', (code) => {
+                clearTimeout(timeout);
+                if (code === 0) {
+                    resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+                    return;
+                }
+                resolve(undefined);
+            });
+            proc.on('error', () => {
+                clearTimeout(timeout);
+                resolve(undefined);
+            });
+        });
+    }
     async findNmTool() {
         const candidates = ['arm-none-eabi-nm', 'arm-none-eabi-nm.exe'];
         for (const cmd of candidates) {
             const ok = await this.checkTool(cmd);
             if (ok) {
+                console.log(`[waveform-plotter] findNmTool: found "${cmd}" in PATH`);
                 return cmd;
             }
         }
@@ -245,20 +697,24 @@ class ElfSymbolResolver {
         ];
         for (const p of common) {
             if (fs_1.default.existsSync(p)) {
+                console.log(`[waveform-plotter] findNmTool: found at "${p}"`);
                 return p;
             }
         }
         const fromEnv = process.env.ARM_NONE_EABI_NM;
         if (fromEnv && fs_1.default.existsSync(fromEnv)) {
+            console.log(`[waveform-plotter] findNmTool: found via env at "${fromEnv}"`);
             return fromEnv;
         }
         if (this.lastElfPath) {
             const elfDir = path_1.default.dirname(this.lastElfPath);
             const localCandidate = path_1.default.join(elfDir, 'arm-none-eabi-nm');
             if (fs_1.default.existsSync(localCandidate)) {
+                console.log(`[waveform-plotter] findNmTool: found locally at "${localCandidate}"`);
                 return localCandidate;
             }
         }
+        console.error('[waveform-plotter] findNmTool: arm-none-eabi-nm NOT FOUND');
         return undefined;
     }
     async findGdbTool() {
@@ -266,6 +722,7 @@ class ElfSymbolResolver {
         for (const cmd of candidates) {
             const ok = await this.checkTool(cmd);
             if (ok) {
+                console.log(`[waveform-plotter] findGdbTool: found "${cmd}" in PATH`);
                 return cmd;
             }
         }
@@ -277,13 +734,16 @@ class ElfSymbolResolver {
         ];
         for (const p of common) {
             if (fs_1.default.existsSync(p)) {
+                console.log(`[waveform-plotter] findGdbTool: found at "${p}"`);
                 return p;
             }
         }
         const fromEnv = process.env.ARM_NONE_EABI_GDB;
         if (fromEnv && fs_1.default.existsSync(fromEnv)) {
+            console.log(`[waveform-plotter] findGdbTool: found via env at "${fromEnv}"`);
             return fromEnv;
         }
+        console.error('[waveform-plotter] findGdbTool: arm-none-eabi-gdb NOT FOUND');
         return undefined;
     }
     async checkTool(cmd) {
@@ -305,34 +765,168 @@ class ElfSymbolResolver {
     }
 }
 exports.ElfSymbolResolver = ElfSymbolResolver;
-function inferDataType(typeText, sizeText) {
-    const lower = typeText.toLowerCase();
-    if (/^(struct|class|union)\b/.test(lower)) {
-        return undefined;
+function normalizeTypeName(typeText) {
+    return typeText
+        .replace(/^type\s*=\s*/i, '')
+        .replace(/\bconst\b|\bvolatile\b/g, ' ')
+        .replace(/^(class|struct|union)\s+/i, '')
+        .replace(/\s*:\s*(?:public|private|protected)\s+.*$/, '')
+        .replace(/\s*[&]+$/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+function buildCompositeTypeCandidates(typeText) {
+    const normalized = normalizeTypeName(typeText);
+    const raw = normalized.replace(/^(class|struct|union)\s+/, '').trim();
+    const candidates = [
+        normalized,
+        raw,
+        `struct ${raw}`,
+        `class ${raw}`,
+        `union ${raw}`
+    ];
+    // 剥离继承信息，尝试裸类型名（如 "Class_Quaternion_f32 : public Class_Matrix_f32<4, 1>" → "Class_Quaternion_f32"）
+    const strippedInheritance = raw.replace(/\s*:\s*(?:public|private|protected)\s+.*$/, '').trim();
+    if (strippedInheritance && strippedInheritance !== raw) {
+        candidates.push(strippedInheritance);
+        candidates.push(`struct ${strippedInheritance}`);
+        candidates.push(`class ${strippedInheritance}`);
+        candidates.push(`union ${strippedInheritance}`);
     }
-    const size = Number.parseInt(sizeText, 10);
-    const byteSize = Number.isFinite(size) && size > 0 ? size : 0;
-    const isFloat = /\bfloat\b/.test(lower);
-    const isDouble = /\bdouble\b/.test(lower);
-    const isUnsigned = /\bunsigned\b|\buint\d*_t\b|\bbool\b/.test(lower);
-    if (isDouble) {
-        return 'DOUBLE';
+    // 提取基类名并加入候选
+    const baseMatch = raw.match(/(?:public|private|protected)\s+(.+)$/);
+    if (baseMatch) {
+        const baseType = baseMatch[1].trim();
+        candidates.push(baseType);
+        candidates.push(`struct ${baseType}`);
+        candidates.push(`class ${baseType}`);
+        candidates.push(`union ${baseType}`);
     }
-    if (isFloat) {
-        return 'FLOAT';
+    return [...new Set(candidates.filter(Boolean))];
+}
+function expandFieldElementPaths(field) {
+    if (!field.arrayDims.length) {
+        return [field.path];
     }
-    if (byteSize === 1) {
-        return isUnsigned ? 'UINT8' : 'INT8';
+    const MAX_EXPANDED_ARRAY_ELEMENTS = 128;
+    let suffixes = [''];
+    for (const dim of field.arrayDims) {
+        if (suffixes.length * dim > MAX_EXPANDED_ARRAY_ELEMENTS) {
+            return [field.path];
+        }
+        const next = [];
+        for (const suffix of suffixes) {
+            for (let index = 0; index < dim; index += 1) {
+                next.push(`${suffix}[${index}]`);
+            }
+        }
+        suffixes = next;
     }
-    if (byteSize === 2) {
-        return isUnsigned ? 'UINT16' : 'INT16';
+    return suffixes.map((suffix) => `${field.path}${suffix}`);
+}
+function computeElementByteSize(field) {
+    if (!field.arrayDims.length) {
+        return field.byteSize;
     }
-    if (byteSize === 4) {
-        return isUnsigned ? 'UINT32' : 'INT32';
+    const totalCount = field.arrayDims.reduce((acc, dim) => acc * dim, 1);
+    return totalCount > 0 ? Math.max(1, Math.floor(field.byteSize / totalCount)) : field.byteSize;
+}
+function joinCompositePath(basePath, childPath) {
+    if (!childPath) {
+        return basePath;
     }
-    if (byteSize === 8) {
-        return 'DOUBLE';
+    return childPath.startsWith('[') ? `${basePath}${childPath}` : `${basePath}.${childPath}`;
+}
+function dedupeLeafInfos(leaves) {
+    const seen = new Set();
+    const out = [];
+    for (const leaf of leaves) {
+        if (!leaf.path || seen.has(leaf.path)) {
+            continue;
+        }
+        seen.add(leaf.path);
+        out.push(leaf);
+    }
+    return out;
+}
+function extractBaseTypeName(typeText) {
+    const match = typeText.match(/(?:public|private|protected)\s+(.+)$/);
+    if (match) {
+        return match[1].trim();
     }
     return undefined;
+}
+function hasInheritance(typeText) {
+    return /:\s*(?:public|private|protected)\s/.test(typeText);
+}
+/**
+ * 解析 ptype /o 输出，提取所有顶层非嵌套成员（含继承成员）。
+ * 返回扁平成员列表，供 hydrateInheritedLeaf 使用。
+ */
+function parseFlatInheritedMembers(ptypeOutput) {
+    const members = [];
+    const lines = ptypeOutput.split(/\r?\n/);
+    let inBody = false;
+    let braceDepth = 0;
+    for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        // 找到类型体起始 { 的位置
+        if (!inBody) {
+            if (line.includes('{')) {
+                inBody = true;
+                const open = (line.match(/\{/g) || []).length;
+                const close = (line.match(/\}/g) || []).length;
+                braceDepth = open - close;
+            }
+            continue;
+        }
+        const openBraces = (line.match(/\{/g) || []).length;
+        const closeBraces = (line.match(/\}/g) || []).length;
+        braceDepth += openBraces - closeBraces;
+        // 类型体结束
+        if (braceDepth <= 0) {
+            break;
+        }
+        // 只处理顶层成员（braceDepth === 1），跳过嵌套结构体/类的内部
+        if (braceDepth !== 1) {
+            continue;
+        }
+        // 跳过访问限定符、total size 行、static 成员、空行
+        if (/^\s*(public|private|protected)\s*:\s*$/.test(line)) {
+            continue;
+        }
+        if (/total size \(bytes\)/i.test(line)) {
+            continue;
+        }
+        if (/^\s*static\b/.test(line)) {
+            continue;
+        }
+        if (/^\s*$/.test(line)) {
+            continue;
+        }
+        // 匹配字段行: /* offset | size */ [type] [ptr*] name[array];
+        const fieldMatch = line.match(/\/\*\s+\d+\s+\|\s+(\d+)\s+\*\/\s+(.+?)\s*([*&]+)?\s*(\w+)(\[(\d+)\])?\s*;/);
+        if (!fieldMatch) {
+            continue;
+        }
+        const size = Number.parseInt(fieldMatch[1], 10);
+        let typeName = fieldMatch[2].trim();
+        const ptrOrRef = fieldMatch[3] ? fieldMatch[3].trim() : '';
+        const fieldName = fieldMatch[4];
+        const arraySize = fieldMatch[6] ? Number.parseInt(fieldMatch[6], 10) : 0;
+        if (ptrOrRef) {
+            typeName = `${typeName} ${ptrOrRef}`.trim();
+        }
+        members.push({
+            name: fieldName,
+            type: normalizeTypeText(typeName),
+            arrayDims: arraySize > 0 ? [arraySize] : [],
+            byteSize: size
+        });
+    }
+    return members;
+}
+function normalizeTypeText(typeText) {
+    return typeText.replace(/\s+/g, ' ').trim();
 }
 //# sourceMappingURL=elfSymbolResolver.js.map

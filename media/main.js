@@ -19,7 +19,6 @@
     settingsBtn: document.getElementById('settingsBtn'),
     varInput: document.getElementById('varInput'),
     addBtn: document.getElementById('addBtn'),
-    channels: document.getElementById('channels'),
     statusLeft: document.getElementById('statusLeft'),
     statusMid: document.getElementById('statusMid'),
     statusRight: document.getElementById('statusRight'),
@@ -94,8 +93,7 @@
     fftCache: null,
     fftCacheVersion: -1,
     lastRenderMs: 0,
-    channelStructSig: '',
-    channelDom: new Map()
+    channelStructSig: ''
   };
 
   const inspState = {
@@ -715,69 +713,6 @@
     if (ui.statusMid.textContent !== state.sessionStatus) ui.statusMid.textContent = state.sessionStatus;
     if (ui.statusRight.textContent !== state.liveStatus) ui.statusRight.textContent = state.liveStatus;
 
-    renderChannelsSmart();
-  }
-
-  function renderChannelsSmart() {
-    const signature = state.variables.map((v) => `${v.name}|${v.color}`).join('\u0001');
-    const structureChanged = signature !== view.channelStructSig;
-    if (structureChanged) {
-      view.channelStructSig = signature;
-      const el = ui.channels;
-      el.innerHTML = '';
-      view.channelDom.clear();
-
-      for (const v of state.variables) {
-        const item = document.createElement('div');
-        item.className = 'chItem';
-        item.style.color = v.color;
-
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.addEventListener('change', () => {
-          vscode.postMessage({ type: 'toggleTracked', name: v.name, checked: cb.checked });
-        });
-
-        const name = document.createElement('span');
-        name.className = 'name';
-        name.textContent = v.name;
-
-        const value = document.createElement('span');
-        value.className = 'value';
-
-        const remove = document.createElement('button');
-        remove.className = 'remove';
-        remove.textContent = '✕';
-        remove.addEventListener('click', () => {
-          vscode.postMessage({ type: 'removeVariable', name: v.name });
-        });
-
-        item.addEventListener('contextmenu', (e) => {
-          e.preventDefault();
-          vscode.postMessage({ type: 'removeVariable', name: v.name });
-        });
-
-        item.appendChild(cb);
-        item.appendChild(name);
-        item.appendChild(value);
-        item.appendChild(remove);
-        el.appendChild(item);
-
-        view.channelDom.set(v.name, { cb, value });
-      }
-    }
-
-    for (const v of state.variables) {
-      const node = view.channelDom.get(v.name);
-      if (!node) continue;
-      if (node.cb.checked !== !!v.checked) {
-        node.cb.checked = !!v.checked;
-      }
-      const text = v.valueText ? ` ${v.valueText}` : '';
-      if (node.value.textContent !== text) {
-        node.value.textContent = text;
-      }
-    }
   }
 
   function fillSettings() {
@@ -1005,7 +940,7 @@
     const tbody = ui.inspectorTbody;
     if (!tbody) return;
 
-    const sig = tree.map(function (r) { return r.name + '|' + r.depth + '|' + r.hasChildren + '|' + r.expanded; }).join('');
+    const sig = tree.map(function (r) { return r.name + '|' + r.depth + '|' + r.hasChildren + '|' + r.expanded + '|' + r.isRoot; }).join('');
     const structChanged = sig !== inspState.prevTreeSig;
 
     if (structChanged) {
@@ -1030,6 +965,12 @@
     for (let i = 0; i < Math.min(rows.length, tree.length); i++) {
       const row = tree[i];
       const tr = rows[i];
+      const cb = tr.querySelector('.insp-check');
+      if (cb) {
+        cb.disabled = row.selectable === false;
+        cb.checked = row.checkState === 'checked';
+        cb.indeterminate = row.checkState === 'partial';
+      }
       const valTd = tr.children[1];
       if (inspState.editingRowName === row.name) continue;
       if (!row.hasChildren) {
@@ -1045,12 +986,32 @@
   function createTreeRow(row) {
     const tr = document.createElement('tr');
     tr.className = 'inspector-row';
+    if (row.isRoot) {
+      tr.addEventListener('contextmenu', function (e) {
+        e.preventDefault();
+        vscode.postMessage({ type: 'removeVariable', name: row.name });
+      });
+    }
 
     const nameTd = document.createElement('td');
+    const wrap = document.createElement('div');
+    wrap.className = 'insp-name-cell';
     const indent = document.createElement('span');
     indent.style.display = 'inline-block';
     indent.style.width = (row.depth * 16) + 'px';
-    nameTd.appendChild(indent);
+    wrap.appendChild(indent);
+
+    if (row.selectable !== false) {
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'insp-check';
+      cb.checked = row.checkState === 'checked';
+      cb.indeterminate = row.checkState === 'partial';
+      cb.addEventListener('change', function () {
+        vscode.postMessage({ type: 'toggleTracked', name: row.name, checked: cb.checked });
+      });
+      wrap.appendChild(cb);
+    }
 
     const toggle = document.createElement('span');
     toggle.className = 'insp-tree-toggle' + (row.hasChildren ? '' : ' leaf');
@@ -1059,12 +1020,19 @@
       e.stopPropagation();
       vscode.postMessage({ type: 'toggleExpand', name: row.name });
     });
-    nameTd.appendChild(toggle);
+    wrap.appendChild(toggle);
+
+    const color = document.createElement('span');
+    color.className = 'insp-color';
+    color.style.background = row.color || 'transparent';
+    color.style.opacity = row.color ? '1' : '0';
+    wrap.appendChild(color);
 
     const nameSpan = document.createElement('span');
     nameSpan.className = 'insp-name-text';
     nameSpan.textContent = row.displayName;
-    nameTd.appendChild(nameSpan);
+    wrap.appendChild(nameSpan);
+    nameTd.appendChild(wrap);
     tr.appendChild(nameTd);
 
     const valTd = document.createElement('td');

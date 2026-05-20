@@ -9,6 +9,8 @@ export type DataType =
   | 'UINT16'
   | 'INT32'
   | 'UINT32'
+  | 'INT64'
+  | 'UINT64'
   | 'FLOAT'
   | 'DOUBLE';
 
@@ -17,6 +19,7 @@ export interface WatchEntry {
   address: number;
   dataType: DataType;
   byteSize: number;
+  declaredTypeText?: string;
 }
 
 export interface TreeViewRow {
@@ -28,6 +31,10 @@ export interface TreeViewRow {
   address: string;
   hasChildren: boolean;
   expanded: boolean;
+  selectable: boolean;
+  checkState: 'checked' | 'partial' | 'unchecked';
+  color: string;
+  isRoot: boolean;
 }
 
 export interface PersistedState {

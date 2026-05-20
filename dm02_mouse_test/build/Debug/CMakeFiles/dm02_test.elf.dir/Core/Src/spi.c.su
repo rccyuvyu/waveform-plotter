@@ -1,0 +1,4 @@
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/Core/Src/spi.c:33:6:MX_SPI2_Init	8	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/Core/Src/spi.c:75:6:MX_SPI6_Init	8	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/Core/Src/spi.c:117:6:HAL_SPI_MspInit	256	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/Core/Src/spi.c:260:6:HAL_SPI_MspDeInit	8	static

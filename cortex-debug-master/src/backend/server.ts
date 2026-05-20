@@ -1,0 +1,277 @@
+import * as ChildProcess from 'child_process';
+import * as os from 'os';
+import * as net from 'net';
+import * as fs from 'fs';
+import * as path from 'path';
+import { EventEmitter } from 'events';
+import { setTimeout } from 'timers';
+import { quoteShellCmdLine } from '../common';
+import { greenFormat } from '../frontend/ansi-helpers';
+
+export let GdbPid = -1;
+
+let ServerLogFilePath: string | null = null;
+export function getServerLogFilePath(): string {
+    if (!ServerLogFilePath) {
+        const tmpDirName = os.tmpdir();
+        ServerLogFilePath = path.join(tmpDirName, 'cortex-debug-server.log');
+    }
+    return ServerLogFilePath;
+}
+
+export function ServerConsoleLog(str: string, usePid?: number) {
+    if (!str) { return; }
+    try {
+        const date = new Date();
+        if (usePid) {
+            GdbPid = usePid;
+        }
+        str = `[${date.toISOString()}] ppid=${process.pid} pid=${GdbPid} ` + str;
+
+        if (!str.endsWith('\n')) {
+            str += '\n';
+        }
+        fs.appendFileSync(getServerLogFilePath(), str);
+    } catch (e) {
+        console.log(e ? e.toString() : 'unknown exception?');
+    }
+}
+
+let currentServers: GDBServer[] = [];
+export class GDBServer extends EventEmitter {
+    private process: ChildProcess.ChildProcess | null = null;
+    private outBuffer: string = '';
+    private errBuffer: string = '';
+    protected consoleSocket: net.Socket | null = null;
+    private initResolve: ((result: boolean) => void) | null = null;
+    private initReject: ((error: any) => void) | null = null;
+    public static readonly SERVER_TIMEOUT = 10 * 60 * 1000;
+    public static readonly LOCALHOST = '0.0.0.0';
+    public pid: number | undefined = -1;
+
+    constructor(
+        private cwd: string | null, private application: string | null, private args: string[],
+        private initMatch: RegExp | null, private port: number | undefined, private consolePort: number) {
+        super();
+    }
+
+    public init(): Thenable<any> {
+        return new Promise(async (resolve, reject) => {
+            if (this.application !== null) {
+                this.initResolve = resolve;
+                this.initReject = reject;
+                try {
+                    await this.connectToConsole();
+                } catch (e) {
+                    ServerConsoleLog('GDBServer: Could not connect to console: ' + e);
+                    reject(e);
+                }
+                this.process = ChildProcess.spawn(this.application, this.args, { cwd: this.cwd || undefined });
+                currentServers.push(this);
+                this.pid = this.process.pid;
+                if (this.process.stdout && this.process.stderr) {
+                    this.process.stdout.on('data', this.onStdout.bind(this));
+                    this.process.stderr.on('data', this.onStderr.bind(this));
+                }
+                this.process.on('exit', this.onExit.bind(this));
+                this.process.on('error', this.onError.bind(this));
+
+                if (this.application.indexOf('st-util') !== -1 && os.platform() === 'win32') {
+                    // For some reason we are not able to capture the st-util output on Windows
+                    // For now assume that it will launch properly within 1/2 second and resolve the init
+                    setTimeout(() => {
+                        if (this.initResolve) {
+                            this.initResolve(true);
+                            this.initReject = null;
+                            this.initResolve = null;
+                        }
+                    }, 500);
+                }
+                if (this.initMatch == null) {
+                    // If there is no init match string (e.g. QEMU) assume launch in 100 ms and resolve
+                    setTimeout(() => {
+                        if (this.initResolve) {
+                            this.initResolve(true);
+                            this.initReject = null;
+                            this.initResolve = null;
+                        }
+                    }, 100);
+                }
+            } else { // For servers like BMP that are always running directly on the probe
+                resolve(true);
+            }
+        });
+    }
+
+    public isExternal(): boolean {
+        return !this.application;
+    }
+
+    public isProcessRunning(): boolean {
+        return !!this.process;
+    }
+
+    private exitTimeout: NodeJS.Timeout | null = null;
+    private killInProgress = false;
+    public exit(): void {
+        if (this.process && !this.killInProgress) {
+            try {
+                ServerConsoleLog(`GDBServer(${this.pid}): forcing an exit with kill()`);
+                this.killInProgress = true;
+                this.process.kill();
+            } catch (e) {
+                ServerConsoleLog(`GDBServer(${this.pid}): Trying to force and exit failed ${e}`);
+            }
+        }
+    }
+
+    private onExit(code: any, signal: any) {
+        if (this.exitTimeout) {
+            clearTimeout(this.exitTimeout);
+            this.exitTimeout = null;
+        }
+        currentServers = currentServers.filter((p) => p !== this);
+        this.process = null;
+        // Give it a bit of delay to drain stdout/stderr
+        setTimeout(() => {
+            ServerConsoleLog(`GDBServer(${this.pid}): exited code=${code} signal=${signal}`);
+            this.emit('exit', code, signal);
+            this.disconnectConsole();
+        }, 10);
+    }
+
+    private onError(err: any) {
+        if (this.initReject) {
+            this.initReject(err);
+            this.initReject = null;
+            this.initResolve = null;
+        }
+
+        this.emit('launcherror', err);
+    }
+
+    private onStdout(data: any) {
+        this.sendToConsole(data);        // Send it without any processing or buffering
+        if (this.initResolve) {
+            if (typeof data === 'string') {
+                this.outBuffer += data;
+            } else {
+                this.outBuffer += data.toString('utf8');
+            }
+
+            if (this.initResolve && this.initMatch && this.initMatch.test(this.outBuffer)) {
+                // console.log(`********* Got initmatch on stdout ${Date.now() - this.startTime}ms`);
+                this.initResolve(true);
+                this.initResolve = null;
+                this.initReject = null;
+            }
+
+            const end = this.outBuffer.lastIndexOf('\n');
+            if (end !== -1) {
+                // this.emit('output', this.outBuffer.substring(0, end));
+                this.outBuffer = this.outBuffer.substring(end + 1);
+            }
+        }
+    }
+
+    private onStderr(data: any) {
+        this.sendToConsole(data);        // Send it without any processing or buffering
+        if (this.initResolve) {
+            if (typeof data === 'string') {
+                this.errBuffer += data;
+            } else {
+                this.errBuffer += data.toString('utf8');
+            }
+
+            if (this.initResolve && this.initMatch && this.initMatch.test(this.errBuffer)) {
+                // console.log(`********* Got initmatch on stderr ${Date.now() - this.startTime}ms`);
+                this.initResolve(true);
+                this.initResolve = null;
+                this.initReject = null;
+            }
+
+            const end = this.errBuffer.lastIndexOf('\n');
+            if (end !== -1) {
+                // this.emit('output', this.errBuffer.substring(0, end));
+                this.errBuffer = this.errBuffer.substring(end + 1);
+            }
+        }
+    }
+
+    protected connectToConsole(): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            const socket = new net.Socket();
+            socket.on('data', (data) => {
+                try {
+                    if (this.process && this.process.stdin) {
+                        this.process.stdin.write(data, 'utf8');
+                    }
+                } catch (e) {
+                    console.error(`stdin write failed ${e}`);
+                }
+            });
+            socket.once('close', () => {
+                this.disconnectConsole();
+            });
+            socket.on('error', (e) => {
+                const code: string = (e as any).code;
+                if (code !== 'ECONNRESET') {
+                    // Can happen if extension exited while we are still running. Rare, generally a bug in VSCode or frontend
+                    const msg = `Error: unexpected socket error ${e}. Please report this problem`;
+                    this.emit('output', msg + '\n');
+                    console.error(msg);
+                    if (!this.consoleSocket) {  // We were already connected
+                        reject(e);
+                    }
+                } else {
+                    // Adapter died/crashed/exited
+                    this.disconnectConsole();
+                }
+            });
+
+            // It is possible that the server is not ready
+            socket.connect(this.consolePort, '127.0.0.1', () => {
+                const app = this.application || '';
+                socket.write(greenFormat(quoteShellCmdLine([app, ...this.args]) + '\n'));
+                this.consoleSocket = socket;
+                resolve();
+            });
+        });
+    }
+
+    private sendToConsole(data: string | Buffer) {
+        if (this.consoleSocket) {
+            this.consoleSocket.write(data);
+        } else {
+            // This can happen if the socket is already closed (extension quit while in a debug session)
+            console.error('sendToConsole: console not open. How did this happen?');
+        }
+    }
+
+    private disconnectConsole() {
+        try {
+            if (this.consoleSocket) {
+                this.consoleSocket.destroy();
+                this.consoleSocket = null;
+            }
+        } catch (e) {
+            console.error('gdb.disconnectConsole', e);
+        }
+    }
+}
+
+// When we have child configurations, VSCode kills this instance of the adapter before we even finish.
+// It appears that when a child terminates, it considers the parent also terminated. However, when we
+// are in server mode (as in when in debug) it does not do that because we are always running.
+//
+// See GDBDebugSession.disconnectRequest()
+process.on('exit', (code: any, signal: any) => {
+    if (currentServers.length > 0) {
+        ServerConsoleLog(`Debug Adapter crashed or killed by VSCode? code=${code} signal=${signal}`);
+        for (const p of [...currentServers]) {
+            p.exit();
+        }
+    } else {
+        ServerConsoleLog(`Debug Adapter exiting code=${code} signal=${signal}`);
+    }
+});

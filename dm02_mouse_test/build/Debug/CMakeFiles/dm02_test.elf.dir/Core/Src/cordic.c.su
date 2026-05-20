@@ -1,0 +1,3 @@
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/Core/Src/cordic.c:30:6:MX_CORDIC_Init	8	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/Core/Src/cordic.c:51:6:HAL_CORDIC_MspInit	8	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/Core/Src/cordic.c:67:6:HAL_CORDIC_MspDeInit	0	static

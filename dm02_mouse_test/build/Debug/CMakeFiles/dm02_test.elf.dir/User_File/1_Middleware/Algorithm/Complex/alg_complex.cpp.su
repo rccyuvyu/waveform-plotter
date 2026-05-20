@@ -1,0 +1,5 @@
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/User_File/1_Middleware/Algorithm/Complex/alg_complex.cpp:26:19:Class_Complex_f32 Namespace_ALG_Complex::Zero()	8	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/User_File/1_Middleware/Algorithm/Complex/alg_complex.cpp:38:19:Class_Complex_f32 Namespace_ALG_Complex::Unit_Real()	8	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/User_File/1_Middleware/Algorithm/Complex/alg_complex.cpp:50:19:Class_Complex_f32 Namespace_ALG_Complex::Unit_Imaginary()	8	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/User_File/1_Middleware/Algorithm/Complex/alg_complex.cpp:63:19:Class_Complex_f32 Namespace_ALG_Complex::Angle_Unit(const float&)	24	static
+/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/User_File/1_Middleware/Algorithm/Complex/alg_complex.cpp:77:19:Class_Complex_f32 Namespace_ALG_Complex::Polar(const float&, const float&)	32	static

@@ -121,22 +121,20 @@ class WaveformViewProvider {
     <button id="addBtn" type="button">+ Add</button>
   </div>
 
-  <div class="channels" id="channels"></div>
-
   <div class="plotWrap">
     <canvas id="plotCanvas"></canvas>
   </div>
 
   <div class="variable-inspector" id="variableInspector">
     <div class="inspector-header" id="inspectorHeader">
-      <span class="inspector-title">Variable Inspector</span>
+      <span class="inspector-title">Variables</span>
       <span id="inspectorToggle">&#9660;</span>
     </div>
     <div class="inspector-body" id="inspectorBody">
       <table class="inspector-table">
         <colgroup>
-          <col style="width:40%">
-          <col style="width:30%">
+          <col style="width:46%">
+          <col style="width:24%">
           <col style="width:14%">
           <col style="width:16%">
         </colgroup>

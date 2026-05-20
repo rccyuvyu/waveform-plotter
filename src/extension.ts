@@ -1,10 +1,14 @@
 import * as vscode from 'vscode';
 import { WaveformController } from './controller';
 import { WaveformViewProvider } from './ui/panel';
+import { activateLogger, log } from './services/logger';
 
 let controller: WaveformController | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  activateLogger(context);
+  log('Extension activating...');
+
   const viewProvider = new WaveformViewProvider(context);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(WaveformViewProvider.viewType, viewProvider)

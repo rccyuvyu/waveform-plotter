@@ -2,7 +2,7 @@
   "name": "waveform-plotter-vscode",
   "displayName": "Waveform Plotter",
   "description": "Variable streaming plotter for embedded debug sessions: passive watch, live telnet, RTT and FFT.",
-  "version": "1.0.19",
+  "version": "1.0.68",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -81,6 +81,11 @@
           "type": "number",
           "default": 10000,
           "description": "Samples per channel buffer size."
+        },
+        "waveformPlotter.elfPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the ELF file. If set, this path is used instead of workspace search. Supports ${workspaceFolder} variable."
         }
       }
     }

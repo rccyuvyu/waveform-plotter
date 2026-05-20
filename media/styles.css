@@ -24,7 +24,7 @@ body {
 
 body {
   display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto auto;
   gap: 4px;
   padding: 6px;
 }
@@ -81,42 +81,6 @@ button:disabled {
 
 .inputRow input {
   flex: 1;
-}
-
-.channels {
-  display: flex;
-  flex-wrap: nowrap;
-  gap: 6px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding-bottom: 2px;
-}
-
-.chItem {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 2px 6px;
-  white-space: nowrap;
-  background: rgba(255, 255, 255, 0.02);
-}
-
-.chItem .name {
-  font-weight: 700;
-}
-
-.chItem .value {
-  opacity: 0.95;
-}
-
-.chItem .remove {
-  border: none;
-  background: transparent;
-  color: #c2cada;
-  padding: 0 2px;
-  cursor: pointer;
 }
 
 .plotWrap {
@@ -278,6 +242,25 @@ dialog .actions {
 
 .insp-name-text {
   font-weight: 500;
+}
+
+.insp-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.insp-check {
+  margin: 0;
+}
+
+.insp-color {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.15);
 }
 
 .insp-value-cell {
