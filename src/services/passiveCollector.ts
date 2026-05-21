@@ -57,16 +57,20 @@ export class PassiveCollector {
     }
 
     for (const varName of trackedVariables) {
-      const ptype = await this.safeEval(session, `ptype ${varName}`, frameId);
+      if (isCompoundExpression(varName)) {
+        const parsed = await this.evaluateNumber(session, varName, frameId);
+        if (parsed !== undefined) {
+          values.set(varName, parsed);
+        }
+        continue;
+      }
+
+      const ptype = await this.safeEval(session, ptypeExpressionCommand(varName), frameId);
       if (ptype && isStructType(ptype)) {
         // 结构体：展开为成员逐个求值
         const memberNames = parseStructMemberNames(ptype);
         for (const member of memberNames) {
           const fullName = `${varName}.${member}`;
-          const memberPtype = await this.safeEval(session, `ptype ${fullName}`, frameId);
-          if (memberPtype && isStructType(memberPtype)) {
-            continue; // 嵌套结构体暂不支持深层展开
-          }
           const parsed = await this.evaluateNumber(session, fullName, frameId);
           if (parsed !== undefined) {
             values.set(fullName, parsed);
@@ -208,6 +212,16 @@ export function parseStructMemberNames(ptypeOutput: string): string[] {
   }
 
   return names;
+}
+
+function ptypeExpressionCommand(expression: string): string {
+  return `ptype (${expression})`;
+}
+
+function isCompoundExpression(expression: string): boolean {
+  return expression.includes('.')
+    || expression.includes('->')
+    || expression.includes('[');
 }
 
 function extractMemberName(declaration: string): string | undefined {

@@ -58,6 +58,10 @@ class WaveformController {
         this.persistTask = Promise.resolve();
         this.suppressAutoLiveUntilNextSession = true;
         this.elfWorkspacePromise = null;
+        this.startLiveWatchTask = null;
+        this.cachedTreeRows = null;
+        /** 树结构签名，用于判断是否需要重建 cachedTreeRows */
+        this.cachedTreeSig = '';
         this.dataBuffer = new dataBuffer_1.DataBuffer(vscode.workspace.getConfiguration('waveformPlotter').get('maxChannels', 8), vscode.workspace.getConfiguration('waveformPlotter').get('bufferSize', 10000));
         this.passiveCollector = new passiveCollector_1.PassiveCollector(this.dataBuffer);
         this.liveWatchService = new liveWatchService_1.LiveWatchService(this.dataBuffer, () => this.scheduleSync());
@@ -603,18 +607,23 @@ class WaveformController {
             for (const uri of uris) {
                 candidates.add(uri.fsPath);
             }
-            if (candidates.size > 1) {
-                break;
-            }
         }
         if (candidates.size === 0) {
             return undefined;
         }
-        if (candidates.size > 1) {
-            console.warn(`[waveform-plotter] Found multiple ELF files. Set waveformPlotter.elfPath to specify the correct one:`, [...candidates]);
-            return undefined;
+        const list = [...candidates];
+        if (list.length > 1) {
+            // 有多个 ELF 文件时按优先级选择：优先 Release/RelWithDebInfo，其次 Debug
+            const release = list.find((p) => /[/\\\\]Release[/\\\\]/i.test(p) || /[/\\\\]RelWithDebInfo[/\\\\]/i.test(p));
+            const chosen = release ?? list[0];
+            const releaseCount = list.filter((p) => /[/\\\\]Release[/\\\\]/i.test(p)).length;
+            const debugCount = list.filter((p) => /[/\\\\]Debug[/\\\\]/i.test(p)).length;
+            console.log(`[waveform-plotter] Found ${list.length} ELF files, auto-selected: "${chosen}" ` +
+                `(Release: ${releaseCount}, Debug: ${debugCount}). ` +
+                `Set waveformPlotter.elfPath to override.`);
+            return chosen;
         }
-        return [...candidates][0];
+        return list[0];
     }
     getConfiguredElfPath() {
         const raw = vscode.workspace.getConfiguration('waveformPlotter').get('elfPath', '').trim();
@@ -638,6 +647,19 @@ class WaveformController {
         }
     }
     async startLiveWatch() {
+        if (this.startLiveWatchTask) {
+            await this.startLiveWatchTask;
+            return;
+        }
+        this.startLiveWatchTask = this.startLiveWatchCore();
+        try {
+            await this.startLiveWatchTask;
+        }
+        finally {
+            this.startLiveWatchTask = null;
+        }
+    }
+    async startLiveWatchCore() {
         const session = this.currentDebugSession ?? vscode.debug.activeDebugSession;
         const tracked = [...new Set(this.state.trackedVariables)];
         const resolveTargets = [...new Set([...this.state.variableNames, ...tracked])];
@@ -795,6 +817,20 @@ class WaveformController {
         }
     }
     buildTreeRows() {
+        // 生成树结构签名，仅在结构/状态变化时重建
+        const treeSig = [
+            this.state.variableNames.join(','),
+            this.state.expandedNodes.join(','),
+            this.state.trackedVariables.join(','),
+            this.liveWatchService.getKnownTreeNodes().join(','),
+            this.liveWatchService.getKnownLeafNodes().join(','),
+            Object.keys(this.liveWatchService.getResolvedEntries()).join(',')
+        ].join('|');
+        if (this.cachedTreeRows && this.cachedTreeSig === treeSig) {
+            // 结构未变，只需要更新值
+            return this.updateCachedTreeValues();
+        }
+        this.cachedTreeSig = treeSig;
         const resolved = this.liveWatchService.getResolvedEntries();
         const expandedSet = new Set(this.state.expandedNodes);
         const allNodes = new Set();
@@ -865,7 +901,7 @@ class WaveformController {
                     address: entry ? `0x${entry.address.toString(16)}` : '',
                     hasChildren: nodeHasChildren,
                     expanded: expandedSet.has(name),
-                    selectable: !nodeHasChildren,
+                    selectable: depth > 0 && !nodeHasChildren,
                     checkState,
                     color: channel?.color ?? '',
                     isRoot: depth === 0
@@ -876,7 +912,40 @@ class WaveformController {
             }
         };
         walk(roots, 0);
+        this.cachedTreeRows = rows;
         return rows;
+    }
+    /** 树结构未变时，只更新值（valueText、checkState、color、address），避免重建整个 DOM */
+    updateCachedTreeValues() {
+        if (!this.cachedTreeRows)
+            return [];
+        const resolved = this.liveWatchService.getResolvedEntries();
+        const channels = this.dataBuffer.getChannels();
+        for (const row of this.cachedTreeRows) {
+            const entry = resolved[row.name];
+            const channel = channels.find((c) => c.name === row.name);
+            const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
+            const previewVal = this.liveWatchService.getLastReadValue(row.name);
+            row.valueText = this.getDisplayValueText(row.name, latest ?? previewVal, entry?.dataType)
+                || this.liveWatchService.getKnownDisplayValue(row.name)
+                || '';
+            row.dataType = entry?.declaredTypeText ?? this.liveWatchService.getKnownLeafDeclaredType(row.name)
+                ?? formatInternalDataType(entry?.dataType ?? this.liveWatchService.getKnownLeafType(row.name));
+            row.address = entry ? `0x${entry.address.toString(16)}` : '';
+            const trackTargets = this.getTrackTargetNames(row.name);
+            const trackedCount = trackTargets.filter((t) => this.state.trackedVariables.includes(t)).length;
+            if (trackedCount === trackTargets.length && trackedCount > 0) {
+                row.checkState = 'checked';
+            }
+            else if (trackedCount > 0) {
+                row.checkState = 'partial';
+            }
+            else {
+                row.checkState = 'unchecked';
+            }
+            row.color = channel?.color ?? '';
+        }
+        return this.cachedTreeRows;
     }
     rebuildBufferFromState() {
         if (this.state.variableNames.length === 0) {
@@ -1060,7 +1129,7 @@ class WaveformController {
                 color: ch?.color ?? '#ccc'
             };
         });
-        // 记录 tree rows 中的值
+        // 构建 tree rows（仅一次，避免 O(n^2) 双重计算）
         const treeRows = this.buildTreeRows();
         const leafRows = treeRows.filter(r => !r.hasChildren);
         const rowsWithValues = leafRows.filter(r => r.valueText);
@@ -1074,7 +1143,7 @@ class WaveformController {
             bufferCapacity: this.dataBuffer.capacity,
             variables,
             data: includeData ? this.buildFilteredSnapshot(visibleChannels) : undefined,
-            treeVariables: this.buildTreeRows(),
+            treeVariables: treeRows,
             status: this.buildStatusText(),
             sessionStatus: this.currentDebugSession ? 'Debug session active' : 'No debug session',
             liveStatus: this.buildLiveStatusText(),
@@ -1159,10 +1228,7 @@ class WaveformController {
         if (resolvedEntries[name]) {
             return true;
         }
-        if (Object.keys(resolvedEntries).some((entryName) => isDescendantPath(entryName, name))) {
-            return true;
-        }
-        return this.liveWatchService.getKnownLeafNodes().some((entryName) => isDescendantPath(entryName, name));
+        return Object.keys(resolvedEntries).some((entryName) => isDescendantPath(entryName, name));
     }
     getTrackTargetNames(name) {
         const descendantCandidates = [

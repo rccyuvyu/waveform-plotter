@@ -43,3 +43,17 @@ npm install
 npm run compile
 ```
 
+## 打包
+
+每次需要产出扩展包时执行：
+
+```bash
+npm run package:vsix
+```
+
+该命令会自动：
+
+- 将版本号按 patch 递增（如 `1.0.88 -> 1.0.89`）
+- 同步更新 `package.json` 和 `package-lock.json`
+- 重新编译 TypeScript
+- 生成对应版本的 `.vsix`

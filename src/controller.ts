@@ -28,6 +28,10 @@ export class WaveformController implements vscode.Disposable {
   private persistTask: Promise<void> = Promise.resolve();
   private suppressAutoLiveUntilNextSession = true;
   private elfWorkspacePromise: Promise<void> | null = null;
+  private startLiveWatchTask: Promise<void> | null = null;
+  private cachedTreeRows: TreeViewRow[] | null = null;
+  /** 树结构签名，用于判断是否需要重建 cachedTreeRows */
+  private cachedTreeSig = '';
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -624,19 +628,28 @@ export class WaveformController implements vscode.Disposable {
       for (const uri of uris) {
         candidates.add(uri.fsPath);
       }
-      if (candidates.size > 1) {
-        break;
-      }
     }
 
     if (candidates.size === 0) {
       return undefined;
     }
-    if (candidates.size > 1) {
-      console.warn(`[waveform-plotter] Found multiple ELF files. Set waveformPlotter.elfPath to specify the correct one:`, [...candidates]);
-      return undefined;
+
+    const list = [...candidates];
+    if (list.length > 1) {
+      // 有多个 ELF 文件时按优先级选择：优先 Release/RelWithDebInfo，其次 Debug
+      const release = list.find((p) => /[/\\\\]Release[/\\\\]/i.test(p) || /[/\\\\]RelWithDebInfo[/\\\\]/i.test(p));
+      const chosen = release ?? list[0];
+      const releaseCount = list.filter((p) => /[/\\\\]Release[/\\\\]/i.test(p)).length;
+      const debugCount = list.filter((p) => /[/\\\\]Debug[/\\\\]/i.test(p)).length;
+      console.log(
+        `[waveform-plotter] Found ${list.length} ELF files, auto-selected: "${chosen}" ` +
+        `(Release: ${releaseCount}, Debug: ${debugCount}). ` +
+        `Set waveformPlotter.elfPath to override.`
+      );
+      return chosen;
     }
-    return [...candidates][0];
+
+    return list[0];
   }
 
   private getConfiguredElfPath(): string | undefined {
@@ -661,6 +674,20 @@ export class WaveformController implements vscode.Disposable {
   }
 
   private async startLiveWatch(): Promise<void> {
+    if (this.startLiveWatchTask) {
+      await this.startLiveWatchTask;
+      return;
+    }
+
+    this.startLiveWatchTask = this.startLiveWatchCore();
+    try {
+      await this.startLiveWatchTask;
+    } finally {
+      this.startLiveWatchTask = null;
+    }
+  }
+
+  private async startLiveWatchCore(): Promise<void> {
     const session = this.currentDebugSession ?? vscode.debug.activeDebugSession;
     const tracked = [...new Set(this.state.trackedVariables)];
     const resolveTargets = [...new Set([...this.state.variableNames, ...tracked])];
@@ -837,6 +864,21 @@ export class WaveformController implements vscode.Disposable {
   }
 
   private buildTreeRows(): TreeViewRow[] {
+    // 生成树结构签名，仅在结构/状态变化时重建
+    const treeSig = [
+      this.state.variableNames.join(','),
+      this.state.expandedNodes.join(','),
+      this.state.trackedVariables.join(','),
+      this.liveWatchService.getKnownTreeNodes().join(','),
+      this.liveWatchService.getKnownLeafNodes().join(','),
+      Object.keys(this.liveWatchService.getResolvedEntries()).join(',')
+    ].join('|');
+    if (this.cachedTreeRows && this.cachedTreeSig === treeSig) {
+      // 结构未变，只需要更新值
+      return this.updateCachedTreeValues();
+    }
+    this.cachedTreeSig = treeSig;
+
     const resolved = this.liveWatchService.getResolvedEntries();
     const expandedSet = new Set(this.state.expandedNodes);
     const allNodes = new Set<string>();
@@ -909,7 +951,7 @@ export class WaveformController implements vscode.Disposable {
           address: entry ? `0x${entry.address.toString(16)}` : '',
           hasChildren: nodeHasChildren,
           expanded: expandedSet.has(name),
-          selectable: !nodeHasChildren,
+          selectable: depth > 0 && !nodeHasChildren,
           checkState,
           color: channel?.color ?? '',
           isRoot: depth === 0
@@ -921,7 +963,38 @@ export class WaveformController implements vscode.Disposable {
     };
 
     walk(roots, 0);
+    this.cachedTreeRows = rows;
     return rows;
+  }
+
+  /** 树结构未变时，只更新值（valueText、checkState、color、address），避免重建整个 DOM */
+  private updateCachedTreeValues(): TreeViewRow[] {
+    if (!this.cachedTreeRows) return [];
+    const resolved = this.liveWatchService.getResolvedEntries();
+    const channels = this.dataBuffer.getChannels();
+    for (const row of this.cachedTreeRows) {
+      const entry = resolved[row.name];
+      const channel = channels.find((c) => c.name === row.name);
+      const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
+      const previewVal = this.liveWatchService.getLastReadValue(row.name);
+      row.valueText = this.getDisplayValueText(row.name, latest ?? previewVal, entry?.dataType)
+        || this.liveWatchService.getKnownDisplayValue(row.name)
+        || '';
+      row.dataType = entry?.declaredTypeText ?? this.liveWatchService.getKnownLeafDeclaredType(row.name)
+        ?? formatInternalDataType(entry?.dataType ?? this.liveWatchService.getKnownLeafType(row.name));
+      row.address = entry ? `0x${entry.address.toString(16)}` : '';
+      const trackTargets = this.getTrackTargetNames(row.name);
+      const trackedCount = trackTargets.filter((t) => this.state.trackedVariables.includes(t)).length;
+      if (trackedCount === trackTargets.length && trackedCount > 0) {
+        row.checkState = 'checked';
+      } else if (trackedCount > 0) {
+        row.checkState = 'partial';
+      } else {
+        row.checkState = 'unchecked';
+      }
+      row.color = channel?.color ?? '';
+    }
+    return this.cachedTreeRows;
   }
 
   private rebuildBufferFromState(): void {
@@ -1143,7 +1216,7 @@ export class WaveformController implements vscode.Disposable {
         color: ch?.color ?? '#ccc'
       };
     });
-    // 记录 tree rows 中的值
+    // 构建 tree rows（仅一次，避免 O(n^2) 双重计算）
     const treeRows = this.buildTreeRows();
     const leafRows = treeRows.filter(r => !r.hasChildren);
     const rowsWithValues = leafRows.filter(r => r.valueText);
@@ -1159,7 +1232,7 @@ export class WaveformController implements vscode.Disposable {
       bufferCapacity: this.dataBuffer.capacity,
       variables,
       data: includeData ? this.buildFilteredSnapshot(visibleChannels) : undefined,
-      treeVariables: this.buildTreeRows(),
+      treeVariables: treeRows,
       status: this.buildStatusText(),
       sessionStatus: this.currentDebugSession ? 'Debug session active' : 'No debug session',
       liveStatus: this.buildLiveStatusText(),
@@ -1245,10 +1318,7 @@ export class WaveformController implements vscode.Disposable {
     if (resolvedEntries[name]) {
       return true;
     }
-    if (Object.keys(resolvedEntries).some((entryName) => isDescendantPath(entryName, name))) {
-      return true;
-    }
-    return this.liveWatchService.getKnownLeafNodes().some((entryName) => isDescendantPath(entryName, name));
+    return Object.keys(resolvedEntries).some((entryName) => isDescendantPath(entryName, name));
   }
 
   private getTrackTargetNames(name: string): string[] {

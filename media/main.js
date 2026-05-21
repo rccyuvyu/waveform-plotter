@@ -940,7 +940,7 @@
     const tbody = ui.inspectorTbody;
     if (!tbody) return;
 
-    const sig = tree.map(function (r) { return r.name + '|' + r.depth + '|' + r.hasChildren + '|' + r.expanded + '|' + r.isRoot; }).join('');
+    const sig = tree.map(function (r) { return r.name + '\x00' + r.depth + '\x00' + r.hasChildren + '\x00' + r.expanded + '\x00' + r.isRoot; }).join('\x01');
     const structChanged = sig !== inspState.prevTreeSig;
 
     if (structChanged) {
@@ -961,24 +961,36 @@
       }
     }
 
-    const rows = tbody.querySelectorAll('tr');
-    for (let i = 0; i < Math.min(rows.length, tree.length); i++) {
-      const row = tree[i];
-      const tr = rows[i];
-      const cb = tr.querySelector('.insp-check');
-      if (cb) {
-        cb.disabled = row.selectable === false;
-        cb.checked = row.checkState === 'checked';
-        cb.indeterminate = row.checkState === 'partial';
-      }
-      const valTd = tr.children[1];
-      if (inspState.editingRowName === row.name) continue;
-      if (!row.hasChildren) {
-        valTd.textContent = row.valueText || '';
-        valTd.className = 'insp-value-cell editable';
-      } else {
-        valTd.textContent = '';
-        valTd.className = 'insp-value-cell';
+    var rows = null;
+    try {
+      rows = tbody.querySelectorAll('tr');
+    } catch (e) { return; }
+    if (!rows) return;
+    var n = Math.min(rows.length, tree.length);
+    for (var i = 0; i < n; i++) {
+      try {
+        var row = tree[i];
+        var tr = rows[i];
+        if (!tr) continue;
+        var cb = tr.querySelector('.insp-check');
+        if (cb) {
+          cb.disabled = row.selectable === false;
+          cb.checked = row.checkState === 'checked';
+          cb.indeterminate = row.checkState === 'partial';
+        }
+        if (inspState.editingRowName === row.name) continue;
+        var valTd = tr.children[1];
+        if (!valTd) continue;
+        if (!row.hasChildren) {
+          var newVal = row.valueText || '';
+          if (valTd.textContent !== newVal) { valTd.textContent = newVal; }
+          valTd.className = 'insp-value-cell editable';
+        } else {
+          valTd.textContent = '';
+          valTd.className = 'insp-value-cell';
+        }
+      } catch (e) {
+        // single row error, skip to avoid cascading
       }
     }
   }

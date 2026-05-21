@@ -177,8 +177,8 @@ export class LiveWatchService {
 
     let count = 0;
     for (const name of varNames) {
-      // 如果该变量之前已解析过且已知是非复合类型，跳过
-      if (this.watchEntries.has(name) && !this.knownTreeNodes.has(name)) {
+      // 如果该变量已有 entries（简单类型或 session 已解析的复合类型），跳过以避免覆盖
+      if (this.watchEntries.has(name)) {
         count += 1;
         continue;
       }
@@ -203,21 +203,28 @@ export class LiveWatchService {
       const watchTree = await this.elfResolver.resolveCompositeWatchTree(name);
       if (watchTree) {
         const leaves = flattenParsedWatchLeaves(name, watchTree);
-        this.removeResolvedEntriesByPrefix(name);
-        this.registerParsedWatchTree(name, watchTree);
-        this.registerEntriesFromParsedLeaves(leaves);
-        console.log(`[waveform-plotter] resolveFromElf: "${name}" composite type, ${leaves.length} leaves`);
-        count += 1;
-        continue;
+        const hasAnyAddress = leaves.some(l => l.address !== undefined && l.address !== 0);
+        if (hasAnyAddress) {
+          // 有有效地址：替换现有 entries 并注册树结构（完全解析）
+          this.removeResolvedEntriesByPrefix(name);
+          this.registerParsedWatchTree(name, watchTree);
+          this.registerEntriesFromParsedLeaves(leaves);
+          const entryCount = [...this.watchEntries.values()].filter(e => e.name.startsWith(name + '.') || e.name === name).length;
+          console.log(`[waveform-plotter] resolveFromElf: "${name}" composite type, ${leaves.length} leaves, ${entryCount} entries`);
+          count += 1;
+          continue;
+        }
+        // 所有叶子地址为 0/undefined（batch GDB 无法解析运行时地址）：
+        // 只在首次注册树结构（用于 WebView 显示），不覆盖已存在的 session entries。
+        if (!this.knownTreeNodes.has(name)) {
+          this.registerParsedWatchTree(name, watchTree);
+          console.log(`[waveform-plotter] resolveFromElf: "${name}" composite tree (${leaves.length} leaves) registered for display, no valid addresses - session will resolve`);
+        }
       }
 
       const compositeLeafInfos = await this.elfResolver.resolveCompositeLeafInfos(name);
       if (compositeLeafInfos.length > 0) {
-        this.removeResolvedEntriesByPrefix(name);
-        this.registerCompositeLeafInfos(name, compositeLeafInfos);
-        console.log(`[waveform-plotter] resolveFromElf: "${name}" ptype fallback, ${compositeLeafInfos.length} leaves`);
-        count += 1;
-        continue;
+        console.log(`[waveform-plotter] resolveFromElf: "${name}" ptype fallback, ${compositeLeafInfos.length} leaves (no addresses), falling through to session`);
       }
 
       // 最终回退：直接解析为表达式
@@ -229,7 +236,23 @@ export class LiveWatchService {
         console.log(`[waveform-plotter] resolveFromElf: "${name}" fallback, addr=0x${entry.address.toString(16)}`);
         count += 1;
       } else {
-        console.warn(`[waveform-plotter] resolveFromElf: "${name}" could not be resolved`);
+        // 最终回退：在全局结构体/类实例中查找成员（例如 "lqr_r_" → "motor.lqr_r_"）
+        try {
+          const memberEntry = await this.elfResolver.resolveAsMember(name);
+          if (memberEntry) {
+            // 保留原始名称，地址已解析为成员的正确地址
+            memberEntry.name = name;
+            this.watchEntries.set(name, memberEntry);
+            this.registerKnownPath(name);
+            this.knownLeafTypes.set(name, memberEntry.dataType);
+            console.log(`[waveform-plotter] resolveFromElf: "${name}" -> member "${memberEntry.name}", addr=0x${memberEntry.address.toString(16)}`);
+            count += 1;
+          } else {
+            console.warn(`[waveform-plotter] resolveFromElf: "${name}" could not be resolved`);
+          }
+        } catch (memberErr) {
+          console.warn(`[waveform-plotter] resolveFromElf: resolveAsMember("${name}") threw`, memberErr);
+        }
       }
     }
     return count;
@@ -246,9 +269,29 @@ export class LiveWatchService {
         const ok = await this.resolveVariableTreeFromCortexDebug(session, name);
         if (ok) {
           count += 1;
+        } else {
+          // cortex-debug 的 liveEvaluate/liveVariables 可能因 GDB 通信问题失败
+          // （如 qXfer 错误），回退到标准 DAP evaluate/variables 路径
+          console.log(`[waveform-plotter] resolveVariables: live path failed for "${name}", falling back to DAP`);
+          const sessionCount = await this.resolveVariablesViaDap(session, [name], threadId);
+          if (sessionCount > 0) {
+            console.log(`[waveform-plotter] resolveVariables: DAP fallback resolved ${sessionCount} entries for "${name}"`);
+            count += sessionCount;
+          } else {
+            console.warn(`[waveform-plotter] resolveVariables: DAP fallback also failed for "${name}"`);
+          }
         }
       }
       return count;
+    }
+
+    return this.resolveVariablesViaDap(session, varNames, threadId);
+  }
+
+  /** 通过标准 DAP evaluate/variables 请求解析变量（用于非 cortex-debug 会话或 cortex-debug 回退） */
+  async resolveVariablesViaDap(session: vscode.DebugSession, varNames: string[], threadId?: number): Promise<number> {
+    if (varNames.length === 0) {
+      return 0;
     }
 
     const t = threadId ?? (await this.pickThreadId(session));
@@ -303,15 +346,26 @@ export class LiveWatchService {
       if (!entry) {
         continue;
       }
-      const ptype = await this.safeEval(session, `ptype ${name}`, frameId);
-      if (!ptype) {
+      const typeText = await this.resolveExpressionTypeText(session, name, frameId);
+      if (!typeText) {
         continue;
       }
-      // 发现之前被 ELF 错误解析为基本类型的结构体 — 展开为成员
-      if (isStructOrClass(ptype)) {
-        this.watchEntries.delete(name);
-        const expanded = await this.expandStructMembers(session, name, frameId);
+      const compositeTypeTree = await this.resolveCompositeTypeTreeViaDebugger(
+        session,
+        typeText,
+        name,
+        frameId,
+        new Set<string>()
+      );
+      if (compositeTypeTree) {
+        const expanded = await this.buildEntriesForParsedLeaves(
+          session,
+          flattenParsedWatchLeaves(name, compositeTypeTree),
+          frameId
+        );
         if (expanded && expanded.length > 0) {
+          this.watchEntries.delete(name);
+          this.registerParsedWatchTree(name, compositeTypeTree);
           for (const e of expanded) {
             this.watchEntries.set(e.name, e);
           }
@@ -320,7 +374,7 @@ export class LiveWatchService {
         continue;
       }
       const sizeResult = await this.safeEval(session, `print (int)sizeof(${name})`, frameId);
-      const type = inferDataType(ptype, sizeResult ?? '');
+      const type = inferDataType(typeText, sizeResult ?? '');
       if (!type) {
         continue;
       }
@@ -883,17 +937,19 @@ export class LiveWatchService {
       if (miTree) {
         const parsedLeaves = flattenParsedWatchLeaves(varName, miTree);
         const parsedEntries = await this.buildEntriesForParsedLeaves(session, parsedLeaves, frameId);
-        if (parsedLeaves.length > 0) {
+        if (parsedEntries.length > 0) {
           this.removeResolvedEntriesByPrefix(varName);
           this.registerParsedWatchTree(varName, miTree);
           return parsedEntries;
         }
+        // batch GDB 无法解析地址（如结构体含指针成员），让 session 实时解析
+        console.log(`[waveform-plotter] expandStructMembers: batch GDB gave tree but no entries for "${varName}", trying live ptype`);
       }
     }
 
     const layoutText =
-      (await this.safeEval(session, `ptype /o ${varName}`, frameId))
-      ?? (await this.safeEval(session, `ptype ${varName}`, frameId));
+      (await this.safeEval(session, ptypeLayoutExpressionCommand(varName), frameId))
+      ?? (await this.safeEval(session, ptypeExpressionCommand(varName), frameId));
     if (!layoutText || !isStructOrClass(layoutText)) {
       return [];
     }
@@ -903,7 +959,7 @@ export class LiveWatchService {
       await this.hydrateParsedWatchTreeViaDebugger(session, parsedTree, frameId, new Set<string>());
       const parsedLeaves = flattenParsedWatchLeaves(varName, parsedTree);
       const parsedEntries = await this.buildEntriesForParsedLeaves(session, parsedLeaves, frameId);
-      if (parsedLeaves.length > 0) {
+      if (parsedEntries.length > 0) {
         this.removeResolvedEntriesByPrefix(varName);
         this.registerParsedWatchTree(varName, parsedTree);
         return parsedEntries;
@@ -921,7 +977,7 @@ export class LiveWatchService {
     if (debuggerLeafInfos.length > 0) {
       const debuggerEntries = await this.buildEntriesForLeafInfos(session, varName, debuggerLeafInfos, frameId);
       const preferDebugger =
-        chosenLeafInfos.length === 0
+        chosenEntries.length === 0
         || debuggerEntries.length > chosenEntries.length
         || (debuggerEntries.length === chosenEntries.length && debuggerLeafInfos.length > chosenLeafInfos.length);
       if (preferDebugger) {
@@ -930,7 +986,7 @@ export class LiveWatchService {
       }
     }
 
-    if (chosenLeafInfos.length === 0) {
+    if (chosenEntries.length === 0) {
       return [];
     }
 
@@ -1202,13 +1258,17 @@ export class LiveWatchService {
         return inferred;
       }
 
-      const fallbackTypeResult = (await session.customRequest('evaluate', {
-        expression: `ptype ${varName}`,
-        frameId,
-        context: 'repl'
-      })) as { result?: string };
+      if (!isCompoundExpression(varName)) {
+        const fallbackTypeResult = (await session.customRequest('evaluate', {
+          expression: ptypeExpressionCommand(varName),
+          frameId,
+          context: 'repl'
+        })) as { result?: string };
 
-      return inferDataType(fallbackTypeResult.result ?? '', sizeResult.result ?? '');
+        return inferDataType(fallbackTypeResult.result ?? '', sizeResult.result ?? '');
+      }
+
+      return undefined;
     } catch {
       return undefined;
     }
@@ -1952,6 +2012,20 @@ function normalizeDeclaredTypeText(typeText: string): string {
     .replace(/\s*:\s*(?:public|private|protected)\s+.*$/, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function ptypeExpressionCommand(expression: string): string {
+  return `ptype (${expression})`;
+}
+
+function ptypeLayoutExpressionCommand(expression: string): string {
+  return `ptype /o (${expression})`;
+}
+
+function isCompoundExpression(expression: string): boolean {
+  return expression.includes('.')
+    || expression.includes('->')
+    || expression.includes('[');
 }
 
 function expandCompositeFieldPaths(field: CompositeFieldInfo): string[] {

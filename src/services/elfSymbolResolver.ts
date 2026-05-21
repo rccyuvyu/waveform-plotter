@@ -164,6 +164,17 @@ export class ElfSymbolResolver {
       }
     }
 
+    // 大小写不敏感回退：全局变量在 ELF 中可能全小写，但用户输入首字母大写（如类名）
+    const lowerVarName = varName.toLowerCase();
+    for (const [key, info] of this.symbolCache) {
+      if (key !== varName && key.toLowerCase() === lowerVarName) {
+        console.log(`[waveform-plotter] findSymbol: "${varName}" case-insensitive matched "${key}"`);
+        return { symbolName: key, info };
+      }
+    }
+
+    console.log(`[waveform-plotter] findSymbol: "${varName}" not found in ${this.symbolCache.size} symbols`);
+
     return undefined;
   }
 
@@ -172,7 +183,9 @@ export class ElfSymbolResolver {
     const exactType = await this.inferDataTypeFromDebug(symbolName, info.size);
     const dt = exactType ?? this.inferDataTypeFromSize(info.size);
     if (!dt) {
-      return undefined;
+      // nm 中有该符号但无法推断类型（如大结构体/类/联合体）：
+      // 仍创建 UINT8 类型条目，byteSize 设为符号实际大小，采样时按原始字节读取
+      return { name, address: info.address, dataType: 'UINT8', byteSize: info.size };
     }
     if (dt === 'ENUM') {
       await this.resolveEnumConstants(symbolName);
@@ -746,7 +759,7 @@ export class ElfSymbolResolver {
         '-ex',
         'set pagination off',
         '-ex',
-        `ptype /o ${symbolName}`
+        ptypeLayoutExpressionCommand(symbolName)
       ];
       const proc = spawn(gdbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
       const stdoutChunks: Buffer[] = [];
@@ -833,6 +846,69 @@ export class ElfSymbolResolver {
     const typeName = typeText.replace(/^enum\s+/, '').trim();
     const constants = this.enumConstantMaps.get(typeName);
     return constants?.get(value);
+  }
+
+  /**
+   * 当变量名不是独立全局符号时，尝试在所有已知的全局结构体/类实例中查找其作为成员的存在。
+   * 例如：用户输入 "lqr_r_"，扫描全局 struct Motor lqr; 后找到 lqr.lqr_r_，返回完整路径。
+   */
+  async resolveAsMember(memberName: string): Promise<WatchEntry | undefined> {
+    if (!this.lastElfPath || !fs.existsSync(this.lastElfPath)) {
+      return undefined;
+    }
+    const gdb = await this.findGdbTool();
+    if (!gdb) {
+      return undefined;
+    }
+
+    // 收集候选父符号：数据段、非函数、size>8 的结构体/类实例
+    const candidates: string[] = [];
+    for (const [name, info] of this.symbolCache) {
+      if (info.size > 8 && /^[a-zA-Z_]/.test(name) && !name.includes('::')) {
+        candidates.push(name);
+      }
+    }
+    if (candidates.length === 0) {
+      return undefined;
+    }
+    // 最多检查 200 个候选，避免 GDB 命令行过长
+    const limited = candidates.slice(0, 200);
+
+    // 单次 GDB batch 调用检查所有候选的 whatis parent.memberName
+    // 用 printf 作标记以精确回映射结果
+    const args: string[] = ['-q', '--batch', this.lastElfPath, '-ex', 'set pagination off'];
+    for (let i = 0; i < limited.length; i++) {
+      args.push('-ex', `printf ">MBRCHK:%d\\n", ${i}`);
+      args.push('-ex', `whatis ${limited[i]}.${memberName}`);
+    }
+
+    const output = await this.runGdbCapture(gdb, args);
+    if (!output) {
+      return undefined;
+    }
+
+    // 解析输出：>MBRCHK:N 之后紧跟 whatis 结果
+    const markerRegex = />MBRCHK:(\d+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = markerRegex.exec(output)) !== null) {
+      const idx = Number.parseInt(m[1], 10);
+      if (idx < 0 || idx >= limited.length) {
+        continue;
+      }
+      // 提取标记之后到下一个标记或结尾之间的文本
+      const startPos = m.index + m[0].length;
+      const nextMarker = output.indexOf('>MBRCHK:', startPos);
+      const section = nextMarker >= 0 ? output.substring(startPos, nextMarker) : output.substring(startPos);
+
+      // 如果 whatis 输出了 "type = ..."，说明成员存在
+      if (section.includes('type = ')) {
+        const fullPath = `${limited[idx]}.${memberName}`;
+        console.log(`[waveform-plotter] resolveAsMember: "${memberName}" -> "${fullPath}"`);
+        return this.resolveExpressionEntry(fullPath);
+      }
+    }
+
+    return undefined;
   }
 
   private async runGdbExpressionInspect(gdbPath: string, elfPath: string, expression: string): Promise<string | undefined> {
@@ -966,6 +1042,10 @@ export class ElfSymbolResolver {
       });
     });
   }
+}
+
+function ptypeLayoutExpressionCommand(expression: string): string {
+  return `ptype /o (${expression})`;
 }
 
 function normalizeTypeName(typeText: string): string {

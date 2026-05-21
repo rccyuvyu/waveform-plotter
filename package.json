@@ -2,7 +2,7 @@
   "name": "waveform-plotter-vscode",
   "displayName": "Waveform Plotter",
   "description": "Variable streaming plotter for embedded debug sessions: passive watch, live telnet, RTT and FFT.",
-  "version": "1.0.79",
+  "version": "1.0.89",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -92,7 +92,8 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -w -p ./"
+    "watch": "tsc -w -p ./",
+    "package:vsix": "node ./scripts/package-vsix.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",
