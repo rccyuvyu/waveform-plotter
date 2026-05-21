@@ -24,7 +24,7 @@ body {
 
 body {
   display: grid;
-  grid-template-rows: auto auto 1fr auto auto;
+  grid-template-rows: auto auto auto 1fr auto auto;
   gap: 4px;
   padding: 6px;
 }
@@ -70,6 +70,39 @@ button:disabled {
 
 .toolbar {
   flex-wrap: wrap;
+}
+
+.statsStrip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.statCard {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02)),
+    rgba(18, 23, 33, 0.9);
+}
+
+.statLabel {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+}
+
+.statCard strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
 }
 
 .split {
@@ -183,6 +216,27 @@ dialog .actions {
 
 .inspector-body.collapsed {
   display: none;
+}
+
+.inspector-tools {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(48, 59, 77, 0.5);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.inspector-tools input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.checkbox.compact {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  color: var(--muted);
 }
 
 .inspector-table {
@@ -301,4 +355,15 @@ dialog .actions {
   text-align: center;
   color: var(--muted);
   font-size: 11px;
+}
+
+@media (max-width: 900px) {
+  .statsStrip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .inspector-tools {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }

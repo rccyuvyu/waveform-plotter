@@ -1143,6 +1143,9 @@ class WaveformController {
             : this.liveWatchService.livePlotting;
         return {
             bufferCapacity: this.dataBuffer.capacity,
+            totalSamples: this.dataBuffer.totalSamples,
+            trackedCount: this.state.trackedVariables.length,
+            activeChannelCount: visibleChannels.length,
             variables,
             data: includeData ? this.buildFilteredSnapshot(visibleChannels) : undefined,
             treeVariables: treeRows,
@@ -1153,6 +1156,9 @@ class WaveformController {
             liveRunning,
             dataSource: this.state.dataSource,
             frequencyHz: this.state.liveWatchFrequency,
+            actualFrequencyHz: this.state.dataSource === 'RTT'
+                ? this.rttService.getActualFrequencyHz()
+                : this.liveWatchService.getActualFrequencyHz(),
             displayMode: this.state.displayMode,
             timeUnit: this.state.timeUnit,
             fontSize: this.state.fontSize,
@@ -1213,17 +1219,19 @@ class WaveformController {
             if (!this.rttService.isRunning.value) {
                 return '';
             }
+            const actualHz = this.rttService.getActualFrequencyHz();
             return this.rttService.lastError
                 ? 'RTT: error'
-                : `RTT: tcp:${this.state.rttPort} (${this.rttService.sampleCount})`;
+                : `RTT: tcp:${this.state.rttPort} ${actualHz > 0 ? `${actualHz.toFixed(actualHz >= 100 ? 0 : 1)}Hz ` : ''}(${this.rttService.sampleCount})`;
         }
         if (!this.liveWatchService.isRunning.value) {
             return '';
         }
         const endpointLabel = this.liveWatchService.getLiveEndpointLabel() || `port:${this.state.telnetPort}`;
+        const actualHz = this.liveWatchService.getActualFrequencyHz();
         return this.liveWatchService.lastError
             ? 'Live: error'
-            : `Live: ${endpointLabel}@${this.state.liveWatchFrequency}Hz (${this.liveWatchService.sampleCount})`;
+            : `Live: ${endpointLabel}@${this.state.liveWatchFrequency}Hz ${actualHz > 0 ? `${actualHz.toFixed(actualHz >= 100 ? 0 : 1)}Hz ` : ''}(${this.liveWatchService.sampleCount})`;
     }
     hasResolvedNameOrDescendant(name) {
         const resolvedEntries = this.liveWatchService.getResolvedEntries();

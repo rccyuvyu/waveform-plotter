@@ -3,6 +3,9 @@ import { TreeViewRow } from '../core/types';
 
 export interface WaveformViewState {
   bufferCapacity: number;
+  totalSamples: number;
+  trackedCount: number;
+  activeChannelCount: number;
   variables: Array<{
     name: string;
     checked: boolean;
@@ -22,6 +25,7 @@ export interface WaveformViewState {
   liveRunning: boolean;
   dataSource: 'Telnet' | 'RTT';
   frequencyHz: number;
+  actualFrequencyHz: number;
   displayMode: 'TIME' | 'FFT';
   timeUnit: 'ms' | 'us';
   fontSize: number;
@@ -139,6 +143,29 @@ export class WaveformViewProvider implements vscode.WebviewViewProvider {
     <button id="settingsBtn">⚙</button>
   </div>
 
+  <div class="statsStrip">
+    <div class="statCard">
+      <span class="statLabel">Source</span>
+      <strong id="sourceBadge">Telnet</strong>
+    </div>
+    <div class="statCard">
+      <span class="statLabel">Actual</span>
+      <strong id="actualHzBadge">0 Hz</strong>
+    </div>
+    <div class="statCard">
+      <span class="statLabel">Tracked</span>
+      <strong id="trackedBadge">0</strong>
+    </div>
+    <div class="statCard">
+      <span class="statLabel">Channels</span>
+      <strong id="channelBadge">0</strong>
+    </div>
+    <div class="statCard">
+      <span class="statLabel">Samples</span>
+      <strong id="samplesBadge">0</strong>
+    </div>
+  </div>
+
   <div class="inputRow">
     <label>Variable:</label>
     <input id="varInput" type="text" placeholder="变量名或表达式" />
@@ -151,10 +178,14 @@ export class WaveformViewProvider implements vscode.WebviewViewProvider {
 
   <div class="variable-inspector" id="variableInspector">
     <div class="inspector-header" id="inspectorHeader">
-      <span class="inspector-title">Variables</span>
+      <span class="inspector-title" id="inspectorTitle">Variables</span>
       <span id="inspectorToggle">&#9660;</span>
     </div>
     <div class="inspector-body" id="inspectorBody">
+      <div class="inspector-tools">
+        <input id="treeFilterInput" type="text" placeholder="筛选变量 / 类型 / 地址" />
+        <label class="checkbox compact"><input id="trackedOnlyInput" type="checkbox" /> 仅显示已勾选</label>
+      </div>
       <table class="inspector-table">
         <colgroup>
           <col style="width:46%">

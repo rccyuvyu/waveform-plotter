@@ -17,6 +17,11 @@
     freqInput: document.getElementById('freqInput'),
     freqLabel: document.getElementById('freqLabel'),
     settingsBtn: document.getElementById('settingsBtn'),
+    sourceBadge: document.getElementById('sourceBadge'),
+    actualHzBadge: document.getElementById('actualHzBadge'),
+    trackedBadge: document.getElementById('trackedBadge'),
+    channelBadge: document.getElementById('channelBadge'),
+    samplesBadge: document.getElementById('samplesBadge'),
     varInput: document.getElementById('varInput'),
     addBtn: document.getElementById('addBtn'),
     statusLeft: document.getElementById('statusLeft'),
@@ -33,15 +38,21 @@
     lineWidth: document.getElementById('lineWidth'),
     refreshFps: document.getElementById('refreshFps'),
     saveSettingsBtn: document.getElementById('saveSettingsBtn'),
+    inspectorTitle: document.getElementById('inspectorTitle'),
     inspectorBody: document.getElementById('inspectorBody'),
     inspectorTbody: document.getElementById('inspectorTbody'),
     inspectorHeader: document.getElementById('inspectorHeader'),
     inspectorToggle: document.getElementById('inspectorToggle'),
+    treeFilterInput: document.getElementById('treeFilterInput'),
+    trackedOnlyInput: document.getElementById('trackedOnlyInput'),
     canvas: document.getElementById('plotCanvas')
   };
 
   const state = {
     bufferCapacity: 10000,
+    totalSamples: 0,
+    trackedCount: 0,
+    activeChannelCount: 0,
     data: { channels: [], timestampsSec: [], version: 0 },
     treeVariables: [],
     variables: [],
@@ -52,6 +63,7 @@
     liveRunning: false,
     dataSource: 'Telnet',
     frequencyHz: 1000,
+    actualFrequencyHz: 0,
     displayMode: 'TIME',
     timeUnit: 'ms',
     fontSize: 12,
@@ -99,6 +111,8 @@
   const inspState = {
     prevTreeSig: '',
     editingRowName: null,
+    filterText: '',
+    trackedOnly: false,
   };
 
   const margins = { top: 12, right: 12, bottom: 28, left: 62 };
@@ -163,6 +177,14 @@
       vscode.postMessage({ type: 'setFrequency', frequencyHz: freq });
     });
     ui.addBtn.addEventListener('click', addVarFromInput);
+    ui.treeFilterInput.addEventListener('input', () => {
+      inspState.filterText = (ui.treeFilterInput.value || '').trim().toLowerCase();
+      renderVariableTree();
+    });
+    ui.trackedOnlyInput.addEventListener('change', () => {
+      inspState.trackedOnly = !!ui.trackedOnlyInput.checked;
+      renderVariableTree();
+    });
     ui.varInput.addEventListener('keydown', (e) => {
       if (e.isComposing) {
         return;
@@ -699,6 +721,11 @@
     ui.recordBtn.disabled = state.recording;
     ui.stopBtn.disabled = !state.recording;
     ui.liveBtn.textContent = state.liveRunning ? (state.dataSource === 'RTT' ? '■ RTT' : '■ Live') : '▶ Live';
+    ui.sourceBadge.textContent = state.dataSource;
+    ui.actualHzBadge.textContent = formatHz(state.actualFrequencyHz);
+    ui.trackedBadge.textContent = String(state.trackedCount);
+    ui.channelBadge.textContent = String(state.activeChannelCount);
+    ui.samplesBadge.textContent = compactInteger(state.totalSamples);
 
     ui.timeBtn.disabled = state.displayMode === 'TIME';
     ui.fftBtn.disabled = state.displayMode === 'FFT';
@@ -936,9 +963,12 @@
   }
 
   function renderVariableTree() {
-    const tree = state.treeVariables || [];
+    const tree = getFilteredTreeRows();
     const tbody = ui.inspectorTbody;
     if (!tbody) return;
+    if (ui.inspectorTitle) {
+      ui.inspectorTitle.textContent = `Variables (${tree.length})`;
+    }
 
     const sig = tree.map(function (r) { return r.name + '\x00' + r.depth + '\x00' + r.hasChildren + '\x00' + r.expanded + '\x00' + r.isRoot; }).join('\x01');
     const structChanged = sig !== inspState.prevTreeSig;
@@ -1116,6 +1146,97 @@
     const n = Number(v);
     if (!Number.isFinite(n)) return fallback;
     return Math.max(min, Math.min(max, n));
+  }
+
+  function getFilteredTreeRows() {
+    const tree = state.treeVariables || [];
+    const filterText = inspState.filterText;
+    const trackedOnly = inspState.trackedOnly;
+    if (!filterText && !trackedOnly) {
+      return tree;
+    }
+
+    const include = new Set();
+    for (const row of tree) {
+      const trackedMatch = !trackedOnly || row.checkState === 'checked' || row.checkState === 'partial';
+      const haystack = `${row.name} ${row.displayName} ${row.dataType} ${row.address}`.toLowerCase();
+      const textMatch = !filterText || haystack.includes(filterText);
+      if (!trackedMatch || !textMatch) {
+        continue;
+      }
+      includeWithAncestors(include, row.name);
+      if (row.hasChildren) {
+        includeDescendants(include, tree, row.name);
+      }
+    }
+
+    return tree.filter((row) => include.has(row.name));
+  }
+
+  function includeWithAncestors(target, name) {
+    const parts = splitWatchPath(name);
+    for (let i = 1; i <= parts.length; i++) {
+      target.add(buildWatchPath(parts.slice(0, i)));
+    }
+  }
+
+  function includeDescendants(target, tree, parentName) {
+    for (const row of tree) {
+      if (isDescendantPath(row.name, parentName)) {
+        target.add(row.name);
+      }
+    }
+  }
+
+  function splitWatchPath(name) {
+    return name.match(/[^.[\]]+|\[[^\]]+\]/g) || [];
+  }
+
+  function buildWatchPath(segments) {
+    let out = '';
+    for (const segment of segments) {
+      if (!out) {
+        out = segment;
+      } else if (segment.startsWith('[')) {
+        out += segment;
+      } else {
+        out += '.' + segment;
+      }
+    }
+    return out;
+  }
+
+  function isDescendantPath(candidate, parent) {
+    const candidateSegments = splitWatchPath(candidate);
+    const parentSegments = splitWatchPath(parent);
+    if (candidateSegments.length <= parentSegments.length) {
+      return false;
+    }
+    for (let i = 0; i < parentSegments.length; i++) {
+      if (candidateSegments[i] !== parentSegments[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function formatHz(value) {
+    const hz = Number(value);
+    if (!Number.isFinite(hz) || hz <= 0) {
+      return '0 Hz';
+    }
+    if (hz >= 1000) {
+      return `${(hz / 1000).toFixed(hz >= 10000 ? 0 : 1)} kHz`;
+    }
+    return `${hz.toFixed(hz >= 100 ? 0 : 1)} Hz`;
+  }
+
+  function compactInteger(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) {
+      return '0';
+    }
+    return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
   }
 
   class FFT {

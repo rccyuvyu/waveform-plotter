@@ -98,6 +98,7 @@ class RttService {
             this.socket = socket;
             socket.setEncoding('utf8');
             socket.setNoDelay(true);
+            socket.setKeepAlive(true, 1000);
             socket.setTimeout(2000);
             socket.on('timeout', () => {
                 // expected for low traffic
@@ -175,34 +176,27 @@ class RttService {
         if (!line) {
             return;
         }
-        const parts = line.split(',');
         const values = new Map();
-        for (let i = 0; i < parts.length && i < this.channelNames.length; i += 1) {
-            const n = Number(parts[i].trim());
-            if (Number.isFinite(n)) {
-                values.set(this.channelNames[i], n);
+        let start = 0;
+        let channelIndex = 0;
+        while (channelIndex < this.channelNames.length && start <= line.length) {
+            let end = line.indexOf(',', start);
+            if (end < 0) {
+                end = line.length;
             }
+            const raw = line.slice(start, end).trim();
+            const n = Number(raw);
+            if (Number.isFinite(n)) {
+                values.set(this.channelNames[channelIndex], n);
+            }
+            channelIndex += 1;
+            start = end + 1;
         }
         if (values.size === 0) {
             return;
         }
-        const activeChannelNames = new Set(this.dataBuffer.getChannels().map((c) => c.name));
-        const aligned = new Map();
-        for (const [name, value] of values) {
-            if (activeChannelNames.has(name)) {
-                aligned.set(name, value);
-            }
-        }
-        if (aligned.size === 0) {
-            return;
-        }
-        for (const name of activeChannelNames) {
-            if (!aligned.has(name)) {
-                aligned.set(name, Number.NaN);
-            }
-        }
         const now = process.hrtime.bigint();
-        this.dataBuffer.pushAll(aligned, now);
+        this.dataBuffer.pushAll(values, now);
         this.sampleCount += 1;
         this.sampleRateMeter.mark(now);
         if (now - this.lastCallbackNs >= 16000000n) {

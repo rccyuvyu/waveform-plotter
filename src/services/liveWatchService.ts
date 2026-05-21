@@ -37,8 +37,6 @@ export class LiveWatchService {
   private endpointLabel = '';
   private sampleBusy = false;
   private loopGeneration = 0;
-  /** 预排序的 entries 缓存，避免每轮采样重复排序 */
-  private cachedSortedEntries: WatchEntry[] | null = null;
   private readonly portDetector = new OpenOcdPortDetector('127.0.0.1');
 
   constructor(private readonly dataBuffer: DataBuffer, private readonly onData: () => void) {}
@@ -432,9 +430,9 @@ export class LiveWatchService {
       return;
     }
 
-    const intervalMs = Math.max(1, Math.floor(1000 / Math.max(1, frequencyHz)));
+    const intervalNs = hzToIntervalNs(frequencyHz);
     const generation = ++this.loopGeneration;
-    void this.runLoop(intervalMs, generation);
+    void this.runLoop(intervalNs, generation);
   }
 
   /**
@@ -457,7 +455,7 @@ export class LiveWatchService {
       return;
     }
 
-    const intervalMs = Math.max(1, Math.floor(1000 / Math.max(1, frequencyHz)));
+    const intervalNs = hzToIntervalNs(frequencyHz);
     const generation = ++this.loopGeneration;
 
     // 尝试 TCL 连接：cortex-debug 常用端口 50001、4445，默认 6666
@@ -491,46 +489,24 @@ export class LiveWatchService {
         this.isRunning.value = false;
         return;
       }
-      void this.runLoop(intervalMs, generation);
+      void this.runLoop(intervalNs, generation);
       return;
     }
 
-    void this.runLoopViaSession(entries, intervalMs, generation);
+    void this.runLoopViaSession(intervalNs, generation);
   }
 
   private async runLoopViaSession(
-    entries: WatchEntry[],
-    intervalMs: number,
+    intervalNs: bigint,
     generation: number
   ): Promise<void> {
-    const intervalNs = BigInt(Math.floor(intervalMs * 1_000_000));
     let nextDeadline = process.hrtime.bigint();
-
-    // 预排序 entries，避免每轮重复排序
-    const sorted = [...entries].filter(e => e.address !== 0);
-    sorted.sort((a, b) => a.address - b.address);
-    this.cachedSortedEntries = sorted;
 
     while (this.isRunning.value && generation === this.loopGeneration) {
       nextDeadline += intervalNs;
       await this.sampleOnceViaTcl();
-
-      const now = process.hrtime.bigint();
-      if (nextDeadline > now) {
-        const remaining = Number(nextDeadline - now);
-        if (remaining >= 2_000_000) {
-          // >=2ms: setTimeout 精度够用
-          await new Promise((r) => setTimeout(r, Math.floor(remaining / 1_000_000)));
-        } else {
-          // <2ms: setTimeout 精度不够，用 setImmediate 让出事件循环后立即返回
-          await new Promise((r) => setImmediate(r));
-        }
-      } else {
-        // 已经落后于计划，让出事件循环后立即继续下一轮
-        await new Promise((r) => setImmediate(r));
-      }
+      await this.waitUntilNextDeadline(nextDeadline);
     }
-    this.cachedSortedEntries = null;
   }
 
   private async sampleOnceViaTcl(): Promise<void> {
@@ -540,46 +516,11 @@ export class LiveWatchService {
     this.sampleBusy = true;
     try {
       const tcl = this.client as OpenOcdTclClient;
-      // 使用预排序缓存，避免每轮重复 filter + sort
-      const all = [...this.watchEntries.values()].filter(e => e.address !== 0);
-      if (!this.cachedSortedEntries || this.cachedSortedEntries.length !== all.length) {
-        all.sort((a, b) => a.address - b.address);
-        this.cachedSortedEntries = all;
-      }
-      const sorted = this.cachedSortedEntries;
+      const sampledEntries = this.getPreferredSampleEntries();
       const values = new Map<string, number>();
 
-      // 按 byteSize 分组（已排序，无需再 sort）
-      const entries1: WatchEntry[] = [];
-      const entries2: WatchEntry[] = [];
-      const entries4: WatchEntry[] = [];
-      const entries8: WatchEntry[] = [];
-      for (const e of sorted) {
-        if (e.byteSize === 1) { entries1.push(e); }
-        else if (e.byteSize === 2) { entries2.push(e); }
-        else if (e.byteSize === 4) { entries4.push(e); }
-        else if (e.byteSize === 8) { entries8.push(e); }
-      }
-
-      // 批量读取连续地址的 1 字节变量
-      if (entries1.length > 0) { await this.batchReadTcl(tcl, entries1, 1, values); }
-      // 批量读取连续地址的 2 字节变量
-      if (entries2.length > 0) { await this.batchReadTcl(tcl, entries2, 2, values); }
-      // 批量读取连续地址的 4 字节变量
-      if (entries4.length > 0) { await this.batchReadTcl(tcl, entries4, 4, values); }
-
-      // 8 字节变量单独读（两个 32 位字）
-      for (const entry of entries8) {
-        try {
-          const rawWords = await tcl.readMemory32(entry.address, 2);
-          if (rawWords.length >= 2) {
-            const raw = (BigInt(rawWords[1] >>> 0) << 32n) | BigInt(rawWords[0] >>> 0);
-            const interpreted = interpretBytes(raw, entry.dataType);
-            if (interpreted !== undefined && Number.isFinite(interpreted)) {
-              values.set(entry.name, interpreted);
-            }
-          }
-        } catch { /* skip */ }
+      if (sampledEntries.length > 0) {
+        await this.batchReadTclBlocks(tcl, sampledEntries, values);
       }
 
       // 始终更新最后读取的值（用于树显示）
@@ -590,26 +531,14 @@ export class LiveWatchService {
       if (values.size > 0) {
         // 仅在 Live 绘图模式下推数据到 dataBuffer（画波形）
         if (this.livePlotting) {
-          const activeChannelNames = new Set(this.dataBuffer.getChannels().map((c) => c.name));
-          const aligned = new Map<string, number>();
-          for (const [name, value] of values) {
-            if (activeChannelNames.has(name)) {
-              aligned.set(name, value);
-            }
-          }
-          if (aligned.size > 0) {
-            for (const name of activeChannelNames) {
-              if (!aligned.has(name)) {
-                aligned.set(name, Number.NaN);
-              }
-            }
+          if (this.dataBuffer.getChannels().length > 0) {
             const nowNs = process.hrtime.bigint();
-            this.dataBuffer.pushAll(aligned, nowNs);
+            this.dataBuffer.pushAll(values, nowNs);
             this.sampleCount += 1;
             this.sampleRateMeter.mark(nowNs);
             this.lastError = undefined;
             if (this.sampleCount <= 3) {
-              const sampleStr = [...aligned.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
+              const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
               console.log(`[waveform-plotter] sampleViaTcl #${this.sampleCount}: ${sampleStr}`);
             }
           }
@@ -621,62 +550,38 @@ export class LiveWatchService {
     }
   }
 
-  /**
-   * 批量读取同一字节大小的变量。
-   * 将连续地址合并为一条 TCL 命令，大幅减少 round-trip 次数。
-   */
-  private async batchReadTcl(
+  private async batchReadTclBlocks(
     client: OpenOcdTclClient,
-    sorted: WatchEntry[],
-    byteSize: 1 | 2 | 4,
+    entries: WatchEntry[],
     outValues: Map<string, number>
   ): Promise<void> {
-    if (sorted.length === 0) { return; }
+    if (entries.length === 0) {
+      return;
+    }
 
-    const readFn = byteSize === 1
-      ? (addr: number, cnt: number) => client.readMemory8(addr, cnt)
-      : byteSize === 2
-        ? (addr: number, cnt: number) => client.readMemory16(addr, cnt)
-        : (addr: number, cnt: number) => client.readMemory32(addr, cnt);
-
-    let i = 0;
-    while (i < sorted.length) {
-      // 找到连续地址范围
-      let j = i + 1;
-      while (j < sorted.length) {
-        const expected = sorted[j - 1].address + byteSize;
-        if (sorted[j].address !== expected) { break; }
-        j++;
-      }
-
-      const batch = sorted.slice(i, j);
-      const startAddr = batch[0].address;
-      const count = batch.length;
-
+    const blocks = buildTclReadBlocks(entries);
+    for (const block of blocks) {
       try {
-        const rawValues = await readFn(startAddr, count);
-        for (let k = 0; k < batch.length; k++) {
-          const raw = BigInt(rawValues[k] ?? 0);
-          const interpreted = interpretBytes(raw, batch[k].dataType);
-          if (interpreted !== undefined && Number.isFinite(interpreted)) {
-            outValues.set(batch[k].name, interpreted);
+        const rawWords = await client.readMemory32(block.startAddress, block.wordCount);
+        for (const entry of block.entries) {
+          const raw = extractEntryRawFromWords(rawWords, block.startAddress, entry);
+          const interpreted = interpretBytes(raw, entry.dataType);
+          if (Number.isFinite(interpreted)) {
+            outValues.set(entry.name, interpreted);
           }
         }
       } catch {
-        // 批量读失败时回退到逐条读取
-        for (const entry of batch) {
+        for (const entry of block.entries) {
           try {
-            const single = await readFn(entry.address, 1);
-            const raw = BigInt(single[0] ?? 0);
-            const interpreted = interpretBytes(raw, entry.dataType);
-            if (interpreted !== undefined && Number.isFinite(interpreted)) {
-              outValues.set(entry.name, interpreted);
+            const parsed = await this.readViaTcl(client, entry);
+            if (parsed !== undefined && Number.isFinite(parsed)) {
+              outValues.set(entry.name, parsed);
             }
-          } catch { /* skip */ }
+          } catch {
+            // skip
+          }
         }
       }
-
-      i = j;
     }
   }
 
@@ -744,6 +649,37 @@ export class LiveWatchService {
 
   getActualFrequencyHz(): number {
     return this.sampleRateMeter.getHz();
+  }
+
+  private getPreferredSampleEntries(entries = [...this.watchEntries.values()]): WatchEntry[] {
+    const filtered = entries.filter((entry) => entry.address !== 0);
+    if (!this.livePlotting) {
+      return filtered;
+    }
+
+    const activeChannels = this.dataBuffer.getChannels();
+    if (activeChannels.length === 0) {
+      return filtered;
+    }
+
+    const activeNames = new Set(activeChannels.map((channel) => channel.name));
+    return filtered.filter((entry) => activeNames.has(entry.name));
+  }
+
+  private async waitUntilNextDeadline(deadlineNs: bigint): Promise<void> {
+    const now = process.hrtime.bigint();
+    if (deadlineNs <= now) {
+      await new Promise((resolve) => setImmediate(resolve));
+      return;
+    }
+
+    const remainingNs = deadlineNs - now;
+    if (remainingNs >= 2_000_000n) {
+      await new Promise((resolve) => setTimeout(resolve, Number(remainingNs / 1_000_000n)));
+      return;
+    }
+
+    await new Promise((resolve) => setImmediate(resolve));
   }
 
   /** 将用户输入的字符串解析为与 dataType 匹配的原始数值（整数类型返回无符号值，FLOAT 返回 uint32 位模式，DOUBLE 返回浮点数自身） */
@@ -844,15 +780,12 @@ export class LiveWatchService {
     }
   }
 
-  private async runLoop(intervalMs: number, generation: number): Promise<void> {
+  private async runLoop(intervalNs: bigint, generation: number): Promise<void> {
+    let nextDeadline = process.hrtime.bigint();
     while (this.isRunning.value && generation === this.loopGeneration) {
-      const startNs = process.hrtime.bigint();
+      nextDeadline += intervalNs;
       await this.sampleOnce();
-      const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1_000_000;
-      const waitMs = Math.max(0, intervalMs - elapsedMs);
-      if (waitMs > 0) {
-        await sleep(waitMs);
-      }
+      await this.waitUntilNextDeadline(nextDeadline);
     }
   }
 
@@ -866,7 +799,8 @@ export class LiveWatchService {
     }
 
     const entries = [...this.watchEntries.values()];
-    if (entries.length === 0) {
+    const sampledEntries = this.getPreferredSampleEntries(entries);
+    if (sampledEntries.length === 0) {
       return;
     }
 
@@ -874,21 +808,16 @@ export class LiveWatchService {
     try {
       const values = new Map<string, number>();
       if (this.clientMode === 'tcl') {
-        for (const entry of entries) {
-          const parsed = await this.readViaTcl(client as OpenOcdTclClient, entry);
-          if (parsed !== undefined) {
-            values.set(entry.name, parsed);
-          }
-        }
+        await this.batchReadTclBlocks(client as OpenOcdTclClient, sampledEntries, values);
       } else {
-        const commands = entries.map((entry) => buildTelnetReadCommand(entry));
+        const commands = sampledEntries.map((entry) => buildTelnetReadCommand(entry));
         const responses = await (client as TelnetClient).sendBatch(commands, 700);
-        if (responses.length !== entries.length) {
-          console.warn(`[waveform-plotter] sampleOnce: expected ${entries.length} responses, got ${responses.length}`);
+        if (responses.length !== sampledEntries.length) {
+          console.warn(`[waveform-plotter] sampleOnce: expected ${sampledEntries.length} responses, got ${responses.length}`);
           return; // finally 块会重置 sampleBusy
         }
-        for (let i = 0; i < entries.length; i += 1) {
-          const entry = entries[i];
+        for (let i = 0; i < sampledEntries.length; i += 1) {
+          const entry = sampledEntries[i];
           const raw = parseOpenocdResponse(responses[i], entry.dataType);
           if (raw === undefined) {
             continue;
@@ -899,26 +828,18 @@ export class LiveWatchService {
       }
 
       if (values.size > 0) {
-        const activeChannelNames = new Set(this.dataBuffer.getChannels().map((c) => c.name));
-        const aligned = new Map<string, number>();
         for (const [name, value] of values) {
-          if (activeChannelNames.has(name)) {
-            aligned.set(name, value);
-          }
+          this.lastReadValues.set(name, value);
         }
-        if (aligned.size > 0) {
-          for (const name of activeChannelNames) {
-            if (!aligned.has(name)) {
-              aligned.set(name, Number.NaN);
-            }
-          }
+
+        if (this.livePlotting && this.dataBuffer.getChannels().length > 0) {
           const nowNs = process.hrtime.bigint();
-          this.dataBuffer.pushAll(aligned, nowNs);
+          this.dataBuffer.pushAll(values, nowNs);
           this.sampleCount += 1;
           this.sampleRateMeter.mark(nowNs);
           this.lastError = undefined;
           if (this.sampleCount <= 3) {
-            const sampleStr = [...aligned.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
+            const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
             console.log(`[waveform-plotter] sampleOnce #${this.sampleCount}: ${sampleStr}`);
           }
         }
@@ -1916,10 +1837,6 @@ function inferByteSizeFromDeclaredType(typeText: string): number | undefined {
   return undefined;
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function buildTelnetReadCommand(entry: WatchEntry): string {
   const addr = `0x${entry.address.toString(16)}`;
   switch (entry.dataType) {
@@ -1963,6 +1880,67 @@ function buildConnectionAttempts(preferredPort: number): Array<{ mode: 'telnet' 
   push('telnet', 50002);
   push('telnet', 4444);
   return attempts;
+}
+
+function hzToIntervalNs(frequencyHz: number): bigint {
+  const hz = Math.max(1, frequencyHz);
+  return BigInt(Math.max(1, Math.round(1_000_000_000 / hz)));
+}
+
+function buildTclReadBlocks(entries: WatchEntry[]): Array<{
+  startAddress: number;
+  wordCount: number;
+  entries: WatchEntry[];
+}> {
+  const sorted = [...entries].sort((a, b) => a.address - b.address);
+  const blocks: Array<{
+    startAddress: number;
+    endAddressExclusive: number;
+    entries: WatchEntry[];
+  }> = [];
+
+  for (const entry of sorted) {
+    const startAddress = alignDown4(entry.address);
+    const endAddressExclusive = alignUp4(entry.address + Math.max(1, entry.byteSize));
+    const last = blocks[blocks.length - 1];
+    if (last && startAddress <= last.endAddressExclusive) {
+      last.endAddressExclusive = Math.max(last.endAddressExclusive, endAddressExclusive);
+      last.entries.push(entry);
+      continue;
+    }
+
+    blocks.push({
+      startAddress,
+      endAddressExclusive,
+      entries: [entry]
+    });
+  }
+
+  return blocks.map((block) => ({
+    startAddress: block.startAddress,
+    wordCount: Math.max(1, (block.endAddressExclusive - block.startAddress) >>> 2),
+    entries: block.entries
+  }));
+}
+
+function extractEntryRawFromWords(rawWords: number[], blockStartAddress: number, entry: WatchEntry): bigint {
+  const byteOffset = entry.address - blockStartAddress;
+  let raw = 0n;
+  for (let i = 0; i < Math.max(1, entry.byteSize); i += 1) {
+    const absoluteByte = byteOffset + i;
+    const word = rawWords[absoluteByte >>> 2] ?? 0;
+    const byteValue = (word >>> ((absoluteByte & 0x3) * 8)) & 0xFF;
+    raw |= BigInt(byteValue) << BigInt(i * 8);
+  }
+  return raw;
+}
+
+function alignDown4(value: number): number {
+  return value & ~0x3;
+}
+
+function alignUp4(value: number): number {
+  return (value + 3) & ~0x3;
 }
 
 function parseOpenocdResponse(response: string, dt: DataType): bigint | undefined {
