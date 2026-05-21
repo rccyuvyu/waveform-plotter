@@ -903,7 +903,7 @@ class WaveformController {
                     address: entry ? `0x${entry.address.toString(16)}` : '',
                     hasChildren: nodeHasChildren,
                     expanded: expandedSet.has(name),
-                    selectable: depth > 0 && !nodeHasChildren,
+                    selectable: depth > 0 && isSelectableLeafNode(nodeHasChildren, declaredTypeText, entry?.dataType ?? hintedType),
                     checkState,
                     color: channel?.color ?? '',
                     isRoot: depth === 0
@@ -1400,6 +1400,22 @@ function clamp(v, min, max, fallback) {
         return fallback;
     }
     return Math.max(min, Math.min(max, v));
+}
+function isSelectableLeafNode(hasChildren, declaredTypeText, dataType) {
+    if (hasChildren) {
+        return false;
+    }
+    if (dataType) {
+        return true;
+    }
+    if (!declaredTypeText) {
+        return false;
+    }
+    const normalized = declaredTypeText.replace(/\s+/g, ' ').trim();
+    if (/[&*]/.test(normalized) || /^(class|struct|union)\b/i.test(normalized)) {
+        return false;
+    }
+    return true;
 }
 function clampInt(v, min, max, fallback) {
     return Math.round(clamp(v, min, max, fallback));

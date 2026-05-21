@@ -159,7 +159,9 @@ class LiveWatchService {
             // 先通过 nm 判断符号大小：小尺寸(≤8)的变量大概率是基本类型，无需跑 ptype /o
             const symbolSize = this.elfResolver.getSymbolByteSize(name);
             const likelySimple = symbolSize !== undefined && symbolSize <= 8;
-            if (likelySimple) {
+            const declaredTypeText = likelySimple ? await this.elfResolver.resolveDeclaredTypeText(name) : undefined;
+            const compositePointer = declaredTypeText ? isCompositePointerType(declaredTypeText) : false;
+            if (likelySimple && !compositePointer) {
                 const entry = await this.elfResolver.resolveVariable(name);
                 if (entry) {
                     this.watchEntries.set(name, entry);
@@ -187,10 +189,10 @@ class LiveWatchService {
                 }
                 // 所有叶子地址为 0/undefined（batch GDB 无法解析运行时地址）：
                 // 只在首次注册树结构（用于 WebView 显示），不覆盖已存在的 session entries。
-                if (!this.knownTreeNodes.has(name)) {
-                    this.registerParsedWatchTree(name, watchTree);
-                    console.log(`[waveform-plotter] resolveFromElf: "${name}" composite tree (${leaves.length} leaves) registered for display, no valid addresses - session will resolve`);
-                }
+                this.registerParsedWatchTree(name, watchTree);
+                console.log(`[waveform-plotter] resolveFromElf: "${name}" composite tree (${leaves.length} leaves) registered for display, no valid addresses - session will resolve`);
+                count += 1;
+                continue;
             }
             const compositeLeafInfos = await this.elfResolver.resolveCompositeLeafInfos(name);
             if (compositeLeafInfos.length > 0) {
@@ -208,6 +210,27 @@ class LiveWatchService {
             else {
                 // 最终回退：在全局结构体/类实例中查找成员（例如 "lqr_r_" → "motor.lqr_r_"）
                 try {
+                    const memberExpression = await this.elfResolver.resolveMemberExpression(name);
+                    if (memberExpression) {
+                        const memberTree = await this.elfResolver.resolveCompositeWatchTree(memberExpression);
+                        if (memberTree) {
+                            const memberLeaves = (0, watchTreeParser_1.flattenParsedWatchLeaves)(name, memberTree);
+                            const hasMemberAddress = memberLeaves.some((leaf) => leaf.address !== undefined && leaf.address !== 0);
+                            if (hasMemberAddress) {
+                                this.removeResolvedEntriesByPrefix(name);
+                                this.registerParsedWatchTree(name, memberTree);
+                                this.registerEntriesFromParsedLeaves(memberLeaves);
+                                const entryCount = [...this.watchEntries.values()].filter(e => e.name.startsWith(name + '.') || e.name === name).length;
+                                console.log(`[waveform-plotter] resolveFromElf: "${name}" member tree via "${memberExpression}", ${entryCount} entries`);
+                                count += 1;
+                                continue;
+                            }
+                            this.registerParsedWatchTree(name, memberTree);
+                            console.log(`[waveform-plotter] resolveFromElf: "${name}" member tree via "${memberExpression}" registered for display`);
+                            count += 1;
+                            continue;
+                        }
+                    }
                     const memberEntry = await this.elfResolver.resolveAsMember(name);
                     if (memberEntry) {
                         // 保留原始名称，地址已解析为成员的正确地址
@@ -884,6 +907,20 @@ class LiveWatchService {
      * 对每个叶子成员使用 GDB 获取独立地址和类型。
      */
     async expandStructMembers(session, varName, frameId) {
+        const declaredTypeText = await this.resolveExpressionTypeText(session, varName, frameId);
+        if (declaredTypeText && isCompositePointerType(declaredTypeText)) {
+            const derefTree = await this.resolveCompositeTypeTreeViaDebugger(session, declaredTypeText, composePointerDerefExpression(varName), frameId, new Set());
+            if (derefTree) {
+                await this.hydrateParsedWatchTreeViaDebugger(session, derefTree, frameId, new Set());
+                const derefLeaves = (0, watchTreeParser_1.flattenParsedWatchLeaves)(varName, derefTree);
+                const derefEntries = await this.buildEntriesForParsedLeaves(session, derefLeaves, frameId);
+                if (derefEntries.length > 0) {
+                    this.removeResolvedEntriesByPrefix(varName);
+                    this.registerParsedWatchTree(varName, derefTree);
+                    return derefEntries;
+                }
+            }
+        }
         if (this.elfResolver.isLoaded()) {
             const miTree = await this.elfResolver.resolveCompositeWatchTree(varName);
             if (miTree) {
@@ -1148,6 +1185,7 @@ class LiveWatchService {
             return undefined;
         }
         await this.populateLiveNodeChildrenFromVariables(session, evaluated);
+        await this.populateLiveNodePointerChildren(session, evaluated);
         return evaluated;
     }
     async evaluateLiveNode(session, expression, fullName, displayName) {
@@ -1178,6 +1216,7 @@ class LiveWatchService {
     }
     async populateLiveNodeChildrenFromVariables(session, node) {
         if (!node.variablesReference) {
+            await this.populateLiveNodePointerChildren(session, node);
             return;
         }
         const children = await this.listLiveChildren(session, node.variablesReference);
@@ -1201,6 +1240,22 @@ class LiveWatchService {
             await this.populateLiveNodeChildrenFromVariables(session, childNode);
             node.children.push(childNode);
         }
+    }
+    async populateLiveNodePointerChildren(session, node) {
+        if (node.children.length > 0 || !isCompositePointerType(node.typeText)) {
+            return;
+        }
+        const derefExpression = composePointerDerefExpression(node.expression);
+        const derefNode = await this.evaluateLiveNode(session, derefExpression, node.fullName, node.name);
+        if (!derefNode) {
+            return;
+        }
+        await this.populateLiveNodeChildrenFromVariables(session, derefNode);
+        if (derefNode.children.length === 0) {
+            return;
+        }
+        node.children = derefNode.children;
+        node.variablesReference = derefNode.variablesReference;
     }
     async safeLiveEvaluate(session, expression) {
         try {
@@ -1279,6 +1334,7 @@ class LiveWatchService {
         return 4;
     }
     registerLiveNodeTree(rootName, root) {
+        this.removeKnownNodesByPrefix(rootName);
         const rootIsLeaf = root.children.length === 0 && root.variablesReference === 0;
         const walk = (node) => {
             this.knownTreeNodes.add(node.fullName);
@@ -1488,6 +1544,7 @@ class LiveWatchService {
         if (!rootTree) {
             return;
         }
+        this.removeKnownNodesByPrefix(rootName);
         const nodes = (0, watchTreeParser_1.flattenParsedWatchNodes)(rootName, rootTree);
         this.knownTreeNodes.add(rootName);
         for (const node of nodes) {
@@ -1747,7 +1804,7 @@ function normalizeCompositeTypeName(typeText) {
         .replace(/\bconst\b|\bvolatile\b/g, ' ')
         .replace(/^(class|struct|union)\s+/i, '')
         .replace(/\s*:\s*(?:public|private|protected)\s+.*$/, '')
-        .replace(/\s*[&]+$/g, '')
+        .replace(/\s*[&*]+$/g, '')
         .replace(/\s+/g, ' ')
         .trim();
 }
@@ -1768,6 +1825,13 @@ function isCompoundExpression(expression) {
     return expression.includes('.')
         || expression.includes('->')
         || expression.includes('[');
+}
+function isCompositePointerType(typeText) {
+    const normalized = typeText.replace(/^type\s*=\s*/i, '').replace(/\s+/g, ' ').trim();
+    return /^(class|struct|union)\b/i.test(normalized) && /\*\s*$/.test(normalized);
+}
+function composePointerDerefExpression(expression) {
+    return `*(${expression})`;
 }
 function expandCompositeFieldPaths(field) {
     if (!field.arrayDims.length) {

@@ -55,6 +55,16 @@ class ElfSymbolResolver {
         }
         return this.resolveExpressionEntry(varName);
     }
+    async resolveDeclaredTypeText(expression) {
+        if (!this.lastElfPath || !fs_1.default.existsSync(this.lastElfPath)) {
+            return undefined;
+        }
+        const gdb = await this.findGdbTool();
+        if (!gdb) {
+            return undefined;
+        }
+        return this.resolveExpressionTypeText(gdb, this.lastElfPath, expression);
+    }
     async resolveCompositeLeafPaths(varName) {
         const infos = await this.resolveCompositeLeafInfos(varName);
         return infos.map((info) => info.path);
@@ -83,6 +93,17 @@ class ElfSymbolResolver {
         const gdb = await this.findGdbTool();
         if (!gdb) {
             return undefined;
+        }
+        const declaredTypeText = await this.resolveExpressionTypeText(gdb, this.lastElfPath, expr);
+        if (declaredTypeText && isCompositePointerTypeText(declaredTypeText)) {
+            const derefExpression = composePointerDerefExpression(expr);
+            const derefTree = await this.resolveCompositeTypeTreeForElf(gdb, this.lastElfPath, declaredTypeText, derefExpression, new Set());
+            if (derefTree) {
+                await this.hydrateParsedWatchTreeForElf(gdb, this.lastElfPath, derefTree, new Set());
+                await this.resolvePtypeLeafAddresses(gdb, this.lastElfPath, derefTree);
+                this.compositeTreeCache.set(cacheKey, this.cloneParsedWatchNode(derefTree) ?? null);
+                return this.cloneParsedWatchNode(derefTree);
+            }
         }
         // 优先使用 GDB MI 方式：spawn("gdb", ["--interpreter=mi2", "-q", "-nx", elfPath])
         // 此方式只打开 ELF 文件读取 DWARF 调试信息，不连接任何远程目标，不影响调试器
@@ -743,7 +764,7 @@ class ElfSymbolResolver {
      * 当变量名不是独立全局符号时，尝试在所有已知的全局结构体/类实例中查找其作为成员的存在。
      * 例如：用户输入 "lqr_r_"，扫描全局 struct Motor lqr; 后找到 lqr.lqr_r_，返回完整路径。
      */
-    async resolveAsMember(memberName) {
+    async resolveMemberExpression(memberName) {
         if (!this.lastElfPath || !fs_1.default.existsSync(this.lastElfPath)) {
             return undefined;
         }
@@ -790,10 +811,17 @@ class ElfSymbolResolver {
             if (section.includes('type = ')) {
                 const fullPath = `${limited[idx]}.${memberName}`;
                 console.log(`[waveform-plotter] resolveAsMember: "${memberName}" -> "${fullPath}"`);
-                return this.resolveExpressionEntry(fullPath);
+                return fullPath;
             }
         }
         return undefined;
+    }
+    async resolveAsMember(memberName) {
+        const fullPath = await this.resolveMemberExpression(memberName);
+        if (!fullPath) {
+            return undefined;
+        }
+        return this.resolveExpressionEntry(fullPath);
     }
     async runGdbExpressionInspect(gdbPath, elfPath, expression) {
         return new Promise((resolve) => {
@@ -924,9 +952,16 @@ function normalizeTypeName(typeText) {
         .replace(/\bconst\b|\bvolatile\b/g, ' ')
         .replace(/^(class|struct|union)\s+/i, '')
         .replace(/\s*:\s*(?:public|private|protected)\s+.*$/, '')
-        .replace(/\s*[&]+$/g, '')
+        .replace(/\s*[&*]+$/g, '')
         .replace(/\s+/g, ' ')
         .trim();
+}
+function isCompositePointerTypeText(typeText) {
+    const normalized = typeText.replace(/^type\s*=\s*/i, '').replace(/\s+/g, ' ').trim();
+    return /^(class|struct|union)\b/i.test(normalized) && /\*\s*$/.test(normalized);
+}
+function composePointerDerefExpression(expression) {
+    return `*(${expression})`;
 }
 function buildCompositeTypeCandidates(typeText) {
     const normalized = normalizeTypeName(typeText);

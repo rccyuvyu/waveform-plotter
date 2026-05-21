@@ -18,6 +18,7 @@ class GdbMiTreeResolver {
         this.gdbPath = gdbPath;
         this.elfPath = elfPath;
         this.resolvedGdbCache = null;
+        this.tempVarCounter = 0;
         this.stdoutBuf = '';
     }
     async resolve(variableName) {
@@ -87,13 +88,36 @@ class GdbMiTreeResolver {
         // 列出子节点
         const listResult = await this.execSync(gdb, `-var-list-children --all-values ${this.quoteMiString(miName)}`);
         if (listResult.cls !== 'done') {
+            await this.populatePointerChildren(gdb, node);
             return node;
         }
         const children = this.parseMiChildren(listResult.rawResult);
         if (children.length === 0 || this.isPointerType(typeName)) {
+            await this.populatePointerChildren(gdb, node);
             return node;
         }
         for (const childInfo of children) {
+            if (this.isCompositePointerType(childInfo.typeName)) {
+                const childExpr = this.composeChildExpr(expression, childInfo.exp);
+                const childName = this.displayNameFromMiChildExp(childInfo.exp);
+                try {
+                    const childNode = await this.buildTreeFromExpression(gdb, childExpr, childName, false);
+                    node.children.push(childNode);
+                }
+                catch {
+                    const childAddress = await this.resolveAddress(gdb, childExpr);
+                    node.children.push({
+                        name: childName,
+                        relativePath: childName,
+                        expression: childExpr,
+                        declaredTypeText: this.normalizeTypeName(childInfo.typeName),
+                        byteSize: this.guessSize(childInfo.typeName),
+                        address: childAddress,
+                        children: []
+                    });
+                }
+                continue;
+            }
             if (childInfo.numChild <= 0 || this.isPointerType(childInfo.typeName)) {
                 // 叶子节点：直接创建，并解析地址
                 const childExpr = this.composeChildExpr(expression, childInfo.exp);
@@ -161,6 +185,34 @@ class GdbMiTreeResolver {
             }
         }
         return node;
+    }
+    async buildTreeFromExpression(gdb, expression, nodeName, isRoot) {
+        const miName = `tmp${++this.tempVarCounter}`;
+        const createResult = await this.execSync(gdb, `-var-create ${miName} @ ${this.quoteMiString(expression)}`);
+        if (createResult.cls === 'error') {
+            throw new GdbResolveFailure('gdb_failed', createResult.message || `Failed to create varobj for ${expression}`);
+        }
+        try {
+            return await this.buildTreeFromVarobj(gdb, miName, expression, nodeName, isRoot);
+        }
+        finally {
+            await this.execSync(gdb, `-var-delete ${miName}`).catch(() => undefined);
+        }
+    }
+    async populatePointerChildren(gdb, node) {
+        if (!this.isCompositePointerType(node.declaredTypeText) || node.children.length > 0) {
+            return;
+        }
+        const derefExpr = this.composePointerDerefExpr(node.expression);
+        try {
+            const derefNode = await this.buildTreeFromExpression(gdb, derefExpr, node.name, false);
+            if (derefNode.children.length > 0) {
+                node.children = derefNode.children;
+            }
+        }
+        catch {
+            // Keep pointer node as leaf if dereference fails.
+        }
     }
     /** 检测 MI 子节点是否为基类子对象 */
     isBaseClassSubobject(child) {
@@ -450,6 +502,13 @@ class GdbMiTreeResolver {
     }
     isPointerType(typeName) {
         return this.normalizeTypeName(typeName).includes('*');
+    }
+    isCompositePointerType(typeName) {
+        const normalized = this.normalizeTypeName(typeName);
+        return /^(class|struct|union)\b/i.test(normalized) && /\*\s*$/.test(normalized);
+    }
+    composePointerDerefExpr(expr) {
+        return `*(${expr})`;
     }
     isSymbolMissingMessage(message) {
         return /no symbol\b|there is no member or method named\b|no type\b/i.test(message);

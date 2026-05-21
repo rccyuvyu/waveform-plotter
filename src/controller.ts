@@ -953,7 +953,7 @@ export class WaveformController implements vscode.Disposable {
           address: entry ? `0x${entry.address.toString(16)}` : '',
           hasChildren: nodeHasChildren,
           expanded: expandedSet.has(name),
-          selectable: depth > 0 && !nodeHasChildren,
+          selectable: depth > 0 && isSelectableLeafNode(nodeHasChildren, declaredTypeText, entry?.dataType ?? hintedType),
           checkState,
           color: channel?.color ?? '',
           isRoot: depth === 0
@@ -1511,6 +1511,27 @@ function clamp(v: number, min: number, max: number, fallback: number): number {
     return fallback;
   }
   return Math.max(min, Math.min(max, v));
+}
+
+function isSelectableLeafNode(
+  hasChildren: boolean,
+  declaredTypeText: string | undefined,
+  dataType: unknown
+): boolean {
+  if (hasChildren) {
+    return false;
+  }
+  if (dataType) {
+    return true;
+  }
+  if (!declaredTypeText) {
+    return false;
+  }
+  const normalized = declaredTypeText.replace(/\s+/g, ' ').trim();
+  if (/[&*]/.test(normalized) || /^(class|struct|union)\b/i.test(normalized)) {
+    return false;
+  }
+  return true;
 }
 
 function clampInt(v: number, min: number, max: number, fallback: number): number {
