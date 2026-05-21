@@ -1,59 +1,87 @@
-# Waveform Plotter (VSCode)
+# Waveform Plotter
 
+`Waveform Plotter` is a VS Code extension for embedded debugging workflows. It resolves variables from ELF/debug info, samples values from the target, and renders them as live waveforms or FFT spectra inside the editor.
 
-## 已实现功能
+Author: `rccyuvyu`
 
-- 被动模式（调试器 `stopped` 事件触发采样）
-- Live Watch（OpenOCD Telnet 读内存）
-  - ELF 符号解析（`arm-none-eabi-nm`）
-  - GDB 回退地址解析（`print &var` / `ptype` / `sizeof`）
-  - 支持 `int8/16/32`、`uint8/16/32`、`float`、`double`
-- RTT 模式
-  - OpenOCD 自动初始化（`rtt setup/start/server start`）
-  - RAM 区域自动扫描 + 成功区域缓存
-  - RTT TCP 流 CSV 解析
-- 时域 / FFT 频域切换
-  - Hanning 窗 + Cooley-Tukey FFT
-- 绘图交互
-  - 自动追踪最新数据
-  - 左键拖拽平移
-  - 滚轮 Y 缩放
-  - Shift+滚轮 X 缩放
-  - 悬停十字线 + tooltip
-  - 右键重置视图
-- 变量管理
-  - 手动输入 `+ Add`
-  - 编辑器右键 `Add to Waveform Plotter`
-  - 勾选启停、右键/按钮删除
-- CSV 导出
-- 设置持久化（workspaceState）
+## Highlights
 
-## 目录
+- Plot scalar variables directly from a debug session
+- Resolve variables from ELF, GDB, and composite expressions
+- Expand `struct` / `class` trees and browse members in the side panel
+- Live sampling through OpenOCD
+- High-rate streaming through RTT
+- Time-domain and FFT display modes
+- Editable leaf values from the variable inspector
+- CSV export for offline analysis
+- Persistent workspace settings and tracked variables
 
-- `src/extension.ts` 扩展入口
-- `src/controller.ts` 核心控制器（状态、调试监听、数据源控制）
-- `src/services/` Live/RTT/ELF/Telnet/被动采样服务
-- `media/main.js` Webview UI + Canvas 绘图引擎
+## Data Sources
 
-## 运行
+### Live Watch
+
+Uses OpenOCD memory reads for direct polling.
+
+- Best for quick bring-up and low-to-medium rate inspection
+- Supports ELF symbol lookup and debugger-assisted fallback resolution
+- Good when RTT is not available yet
+
+### RTT
+
+Uses OpenOCD RTT server plus target-side streaming.
+
+- Best for higher sampling rates
+- Lower overhead than repeated memory polling
+- Recommended when you want stable high-frequency acquisition
+
+## Main Features
+
+- Passive sampling on debugger `stopped` events
+- Real-time waveform plotting
+- FFT view with windowing
+- Variable tree with expand/collapse, filtering, and tracked-only view
+- Per-channel colors and channel-limit protection
+- Actual sampling-rate feedback in the panel
+- OpenOCD RTT auto-init with RAM region scan and cache
+
+## Typical Workflow
+
+1. Start a debug session or load an ELF in the workspace
+2. Add a variable from the input box or editor context menu
+3. Expand composite nodes if needed
+4. Check the leaf variables you want to plot
+5. Choose `Telnet` or `RTT`
+6. Start live mode and inspect the waveform or FFT
+
+## Project Layout
+
+- `src/extension.ts`: extension entry
+- `src/controller.ts`: state, commands, view sync, source switching
+- `src/services/`: ELF, GDB, Live Watch, RTT, OpenOCD, passive collection
+- `src/ui/`: webview host
+- `media/main.js`: panel logic and canvas renderer
+- `media/styles.css`: panel styles
+
+## Development
 
 ```bash
-cd vscode-waveform-plotter
 npm install
 npm run compile
 ```
 
-## 打包
-
-每次需要产出扩展包时执行：
+## Packaging
 
 ```bash
-npm run package:vsix
+npx @vscode/vsce package --out waveform-plotter-vscode-<version>.vsix
 ```
 
-该命令会自动：
+In this repo, every release build should also bump the patch version in:
 
-- 将版本号按 patch 递增（如 `1.0.88 -> 1.0.89`）
-- 同步更新 `package.json` 和 `package-lock.json`
-- 重新编译 TypeScript
-- 生成对应版本的 `.vsix`
+- `package.json`
+- `package-lock.json`
+
+## Notes
+
+- `arm-none-eabi-nm` and `arm-none-eabi-gdb` are used for symbol/type resolution
+- OpenOCD is required for Live Watch and RTT modes
+- RTT mode depends on target firmware emitting CSV-style channel data

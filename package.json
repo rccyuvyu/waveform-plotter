@@ -2,8 +2,28 @@
   "name": "waveform-plotter-vscode",
   "displayName": "Waveform Plotter",
   "description": "Variable streaming plotter for embedded debug sessions: passive watch, live telnet, RTT and FFT.",
-  "version": "1.0.93",
-  "publisher": "local",
+  "version": "1.0.98",
+  "publisher": "rccyuvyu",
+  "author": "rccyuvyu",
+  "license": "SEE LICENSE IN LICENSE",
+  "icon": "media/icon.png",
+  "keywords": [
+    "embedded",
+    "debug",
+    "waveform",
+    "openocd",
+    "rtt",
+    "fft",
+    "elf"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rccyuvyu/vscode-waveform-plotter.git"
+  },
+  "homepage": "https://github.com/rccyuvyu/vscode-waveform-plotter#readme",
+  "bugs": {
+    "url": "https://github.com/rccyuvyu/vscode-waveform-plotter/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },

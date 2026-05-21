@@ -1,2 +1,0 @@
-/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/User_File/1_Middleware/Driver/WDG/drv_wdg.cpp:30:6:void IWDG_Independent_Feed()	8	static
-/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/User_File/1_Middleware/Driver/WDG/drv_wdg.cpp:39:6:void TIM_1ms_IWDG_PeriodElapsedCallback()	8	static

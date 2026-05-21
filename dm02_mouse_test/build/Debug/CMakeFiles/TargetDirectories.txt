@@ -1,3 +1,0 @@
-/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/build/Debug/CMakeFiles/dm02_test.elf.dir
-/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/build/Debug/CMakeFiles/edit_cache.dir
-/media/rccyuvyu/Data/share/c/c/Microcomputer/STM32/RM/damiao_mc02_bsp/dm02_mouse_test/build/Debug/CMakeFiles/rebuild_cache.dir

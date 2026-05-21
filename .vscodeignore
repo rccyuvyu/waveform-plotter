@@ -1,0 +1,7 @@
+.git/**
+.agents/**
+.codex/**
+.claude/**
+node_modules/**
+1.webp
+waveform-plotter-vscode-*.vsix
