@@ -518,20 +518,28 @@ class LiveWatchService {
             if (values.size > 0) {
                 // 仅在 Live 绘图模式下推数据到 dataBuffer（画波形）
                 if (this.livePlotting) {
-                    // 确保所有读取到的变量在 dataBuffer 中都有对应通道（兼容 setTracked 未及时创建的场景）
-                    for (const name of values.keys()) {
-                        if (!this.dataBuffer.getChannels().some((c) => c.name === name)) {
-                            this.dataBuffer.addChannel(name);
+                    const activeChannelNames = new Set(this.dataBuffer.getChannels().map((c) => c.name));
+                    const aligned = new Map();
+                    for (const [name, value] of values) {
+                        if (activeChannelNames.has(name)) {
+                            aligned.set(name, value);
                         }
                     }
-                    const nowNs = process.hrtime.bigint();
-                    this.dataBuffer.pushAll(values, nowNs);
-                    this.sampleCount += 1;
-                    this.sampleRateMeter.mark(nowNs);
-                    this.lastError = undefined;
-                    if (this.sampleCount <= 3) {
-                        const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
-                        console.log(`[waveform-plotter] sampleViaTcl #${this.sampleCount}: ${sampleStr}`);
+                    if (aligned.size > 0) {
+                        for (const name of activeChannelNames) {
+                            if (!aligned.has(name)) {
+                                aligned.set(name, Number.NaN);
+                            }
+                        }
+                        const nowNs = process.hrtime.bigint();
+                        this.dataBuffer.pushAll(aligned, nowNs);
+                        this.sampleCount += 1;
+                        this.sampleRateMeter.mark(nowNs);
+                        this.lastError = undefined;
+                        if (this.sampleCount <= 3) {
+                            const sampleStr = [...aligned.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
+                            console.log(`[waveform-plotter] sampleViaTcl #${this.sampleCount}: ${sampleStr}`);
+                        }
                     }
                 }
                 this.onData(); // 通知 controller 更新显示
@@ -806,19 +814,28 @@ class LiveWatchService {
                 }
             }
             if (values.size > 0) {
-                for (const name of values.keys()) {
-                    if (!this.dataBuffer.getChannels().some((c) => c.name === name)) {
-                        this.dataBuffer.addChannel(name);
+                const activeChannelNames = new Set(this.dataBuffer.getChannels().map((c) => c.name));
+                const aligned = new Map();
+                for (const [name, value] of values) {
+                    if (activeChannelNames.has(name)) {
+                        aligned.set(name, value);
                     }
                 }
-                const nowNs = process.hrtime.bigint();
-                this.dataBuffer.pushAll(values, nowNs);
-                this.sampleCount += 1;
-                this.sampleRateMeter.mark(nowNs);
-                this.lastError = undefined;
-                if (this.sampleCount <= 3) {
-                    const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
-                    console.log(`[waveform-plotter] sampleOnce #${this.sampleCount}: ${sampleStr}`);
+                if (aligned.size > 0) {
+                    for (const name of activeChannelNames) {
+                        if (!aligned.has(name)) {
+                            aligned.set(name, Number.NaN);
+                        }
+                    }
+                    const nowNs = process.hrtime.bigint();
+                    this.dataBuffer.pushAll(aligned, nowNs);
+                    this.sampleCount += 1;
+                    this.sampleRateMeter.mark(nowNs);
+                    this.lastError = undefined;
+                    if (this.sampleCount <= 3) {
+                        const sampleStr = [...aligned.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
+                        console.log(`[waveform-plotter] sampleOnce #${this.sampleCount}: ${sampleStr}`);
+                    }
                 }
                 this.onData();
             }

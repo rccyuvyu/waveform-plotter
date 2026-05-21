@@ -188,6 +188,7 @@ export class WaveformController implements vscode.Disposable {
     };
 
     if (checked) {
+      this.pruneChannelsToTrackedSet(new Set([...tracked, trimmed]));
       // 只跟踪用户勾选的那一个变量，不自动跟踪其子成员
       if (addTarget(trimmed)) {
         tracked.add(trimmed);
@@ -196,6 +197,7 @@ export class WaveformController implements vscode.Disposable {
       }
     } else {
       tracked.delete(trimmed);
+      this.pruneChannelsToTrackedSet(tracked);
     }
     if (failedTargets.length > 0) {
       const first = failedTargets[0];
@@ -1409,6 +1411,14 @@ export class WaveformController implements vscode.Disposable {
     this.liveWatchService.clearResolvedEntries();
     for (const channelName of this.dataBuffer.getChannels().map((c) => c.name)) {
       this.dataBuffer.removeChannel(channelName);
+    }
+  }
+
+  private pruneChannelsToTrackedSet(allowedNames: Set<string>): void {
+    for (const channelName of this.dataBuffer.getChannels().map((c) => c.name)) {
+      if (!allowedNames.has(channelName)) {
+        this.dataBuffer.removeChannel(channelName);
+      }
     }
   }
 }

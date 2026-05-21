@@ -24,16 +24,20 @@ export class PassiveCollector {
       return;
     }
 
-    const collectedNames = [...values.keys()];
-    for (const name of collectedNames) {
-      if (!this.dataBuffer.getChannels().some((c) => c.name === name)) {
-        this.dataBuffer.addChannel(name);
+    const activeChannelNames = new Set(this.dataBuffer.getChannels().map((c) => c.name));
+    const aligned = new Map<string, number>();
+    for (const [name, value] of values) {
+      if (activeChannelNames.has(name)) {
+        aligned.set(name, value);
       }
     }
-
-    const aligned = new Map<string, number>();
-    for (const name of collectedNames) {
-      aligned.set(name, values.get(name) ?? Number.NaN);
+    if (aligned.size === 0) {
+      return;
+    }
+    for (const name of activeChannelNames) {
+      if (!aligned.has(name)) {
+        aligned.set(name, Number.NaN);
+      }
     }
 
     this.dataBuffer.pushAll(aligned, process.hrtime.bigint());

@@ -186,13 +186,23 @@ class RttService {
         if (values.size === 0) {
             return;
         }
-        for (const name of values.keys()) {
-            if (!this.dataBuffer.getChannels().some((c) => c.name === name)) {
-                this.dataBuffer.addChannel(name);
+        const activeChannelNames = new Set(this.dataBuffer.getChannels().map((c) => c.name));
+        const aligned = new Map();
+        for (const [name, value] of values) {
+            if (activeChannelNames.has(name)) {
+                aligned.set(name, value);
+            }
+        }
+        if (aligned.size === 0) {
+            return;
+        }
+        for (const name of activeChannelNames) {
+            if (!aligned.has(name)) {
+                aligned.set(name, Number.NaN);
             }
         }
         const now = process.hrtime.bigint();
-        this.dataBuffer.pushAll(values, now);
+        this.dataBuffer.pushAll(aligned, now);
         this.sampleCount += 1;
         this.sampleRateMeter.mark(now);
         if (now - this.lastCallbackNs >= 16000000n) {

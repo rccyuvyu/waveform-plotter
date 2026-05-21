@@ -202,6 +202,7 @@ class WaveformController {
             return false;
         };
         if (checked) {
+            this.pruneChannelsToTrackedSet(new Set([...tracked, trimmed]));
             // 只跟踪用户勾选的那一个变量，不自动跟踪其子成员
             if (addTarget(trimmed)) {
                 tracked.add(trimmed);
@@ -212,6 +213,7 @@ class WaveformController {
         }
         else {
             tracked.delete(trimmed);
+            this.pruneChannelsToTrackedSet(tracked);
         }
         if (failedTargets.length > 0) {
             const first = failedTargets[0];
@@ -1308,6 +1310,13 @@ class WaveformController {
         this.liveWatchService.clearResolvedEntries();
         for (const channelName of this.dataBuffer.getChannels().map((c) => c.name)) {
             this.dataBuffer.removeChannel(channelName);
+        }
+    }
+    pruneChannelsToTrackedSet(allowedNames) {
+        for (const channelName of this.dataBuffer.getChannels().map((c) => c.name)) {
+            if (!allowedNames.has(channelName)) {
+                this.dataBuffer.removeChannel(channelName);
+            }
         }
     }
 }
