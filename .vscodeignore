@@ -1,7 +1,13 @@
 .git/**
+.gitignore
 .agents/**
 .codex/**
 .claude/**
 node_modules/**
 1.webp
+media/waveform.svg
+src/**
+scripts/**
+tsconfig.json
+package-lock.json
 waveform-plotter-vscode-*.vsix

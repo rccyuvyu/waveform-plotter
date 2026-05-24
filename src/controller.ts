@@ -32,6 +32,11 @@ export class WaveformController implements vscode.Disposable {
   private cachedTreeRows: TreeViewRow[] | null = null;
   /** 树结构签名，用于判断是否需要重建 cachedTreeRows */
   private cachedTreeSig = '';
+  private cachedTreeStructureVersion = 0;
+  private lastPushedTreeVersion = -1;
+  private treeValueSyncTimer: NodeJS.Timeout | undefined;
+  private lastTreeValueSyncAt = 0;
+  private static readonly TREE_VALUE_SYNC_INTERVAL_MS = 120;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -71,6 +76,10 @@ export class WaveformController implements vscode.Disposable {
     if (this.syncTimer) {
       clearTimeout(this.syncTimer);
       this.syncTimer = undefined;
+    }
+    if (this.treeValueSyncTimer) {
+      clearTimeout(this.treeValueSyncTimer);
+      this.treeValueSyncTimer = undefined;
     }
     void this.liveWatchService.stopLiveWatch();
     void this.rttService.stopRtt();
@@ -865,9 +874,8 @@ export class WaveformController implements vscode.Disposable {
     }
   }
 
-  private buildTreeRows(): TreeViewRow[] {
-    // 生成树结构签名，仅在结构/状态变化时重建
-    const treeSig = [
+  private buildTreeStructureSignature(): string {
+    return [
       this.state.variableNames.join(','),
       this.state.expandedNodes.join(','),
       this.state.trackedVariables.join(','),
@@ -875,23 +883,29 @@ export class WaveformController implements vscode.Disposable {
       this.liveWatchService.getKnownLeafNodes().join(','),
       Object.keys(this.liveWatchService.getResolvedEntries()).join(',')
     ].join('|');
+  }
+
+  private buildTreeRows(): TreeViewRow[] {
+    // 生成树结构签名，仅在结构/状态变化时重建
+    const treeSig = this.buildTreeStructureSignature();
     if (this.cachedTreeRows && this.cachedTreeSig === treeSig) {
       // 结构未变，只需要更新值
       return this.updateCachedTreeValues();
     }
     this.cachedTreeSig = treeSig;
+    this.cachedTreeStructureVersion += 1;
 
     const resolved = this.liveWatchService.getResolvedEntries();
     const expandedSet = new Set(this.state.expandedNodes);
     const allNodes = new Set<string>();
+    const relatedNodes = [
+      ...Object.keys(resolved),
+      ...this.liveWatchService.getKnownTreeNodes()
+    ];
     for (const name of this.state.variableNames) {
       for (const path of getAncestorPaths(name)) {
         allNodes.add(path);
       }
-      const relatedNodes = [
-        ...Object.keys(resolved),
-        ...this.liveWatchService.getKnownTreeNodes()
-      ];
       for (const resolvedName of relatedNodes) {
         if (resolvedName !== name && !isDescendantPath(resolvedName, name)) {
           continue;
@@ -907,21 +921,23 @@ export class WaveformController implements vscode.Disposable {
     const children = new Map<string, string[]>();
     const hasChildren = new Set<string>();
     for (const node of allNodes) {
-      const direct: string[] = [];
-      for (const other of allNodes) {
-        if (other !== node && getParentPath(other) === node) {
-          direct.push(other);
-        }
+      const parent = getParentPath(node);
+      if (!parent) {
+        continue;
       }
-      if (direct.length > 0) {
-        direct.sort();
-        children.set(node, direct);
-        hasChildren.add(node);
-      }
+      const direct = children.get(parent) ?? [];
+      direct.push(node);
+      children.set(parent, direct);
+      hasChildren.add(parent);
+    }
+    for (const [parent, direct] of children.entries()) {
+      direct.sort(compareWatchPaths);
+      children.set(parent, direct);
     }
 
     const roots = [...allNodes].filter((n) => !getParentPath(n)).sort(compareWatchPaths);
     const rows: TreeViewRow[] = [];
+    const channelsByName = new Map(this.dataBuffer.getChannels().map((channel) => [channel.name, channel]));
 
     const walk = (names: string[], depth: number) => {
       for (const name of names) {
@@ -930,7 +946,7 @@ export class WaveformController implements vscode.Disposable {
         const declaredTypeText = entry?.declaredTypeText ?? this.liveWatchService.getKnownLeafDeclaredType(name);
         const displayName = getDisplayName(name);
         const nodeHasChildren = hasChildren.has(name);
-        const channel = this.dataBuffer.getChannels().find((c) => c.name === name);
+        const channel = channelsByName.get(name);
         const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
         const previewVal = this.liveWatchService.getLastReadValue(name);
         const valueText = this.getDisplayValueText(name, latest ?? previewVal, entry?.dataType ?? hintedType)
@@ -944,6 +960,7 @@ export class WaveformController implements vscode.Disposable {
         } else if (trackedCount > 0) {
           checkState = 'partial';
         }
+        const selectable = depth > 0 && isSelectableLeafNode(nodeHasChildren, declaredTypeText, entry?.dataType ?? hintedType);
         rows.push({
           name,
           displayName,
@@ -953,7 +970,8 @@ export class WaveformController implements vscode.Disposable {
           address: entry ? `0x${entry.address.toString(16)}` : '',
           hasChildren: nodeHasChildren,
           expanded: expandedSet.has(name),
-          selectable: depth > 0 && isSelectableLeafNode(nodeHasChildren, declaredTypeText, entry?.dataType ?? hintedType),
+          selectable,
+          editable: selectable && !!entry,
           checkState,
           color: channel?.color ?? '',
           isRoot: depth === 0
@@ -973,10 +991,10 @@ export class WaveformController implements vscode.Disposable {
   private updateCachedTreeValues(): TreeViewRow[] {
     if (!this.cachedTreeRows) return [];
     const resolved = this.liveWatchService.getResolvedEntries();
-    const channels = this.dataBuffer.getChannels();
+    const channelsByName = new Map(this.dataBuffer.getChannels().map((channel) => [channel.name, channel]));
     for (const row of this.cachedTreeRows) {
       const entry = resolved[row.name];
-      const channel = channels.find((c) => c.name === row.name);
+      const channel = channelsByName.get(row.name);
       const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
       const previewVal = this.liveWatchService.getLastReadValue(row.name);
       row.valueText = this.getDisplayValueText(row.name, latest ?? previewVal, entry?.dataType)
@@ -995,6 +1013,7 @@ export class WaveformController implements vscode.Disposable {
         row.checkState = 'unchecked';
       }
       row.color = channel?.color ?? '';
+      row.editable = row.selectable && !!entry;
     }
     return this.cachedTreeRows;
   }
@@ -1039,12 +1058,12 @@ export class WaveformController implements vscode.Disposable {
     session: vscode.DebugSession,
     names: string[]
   ): Promise<void> {
-    const values = await this.passiveCollector.readCurrentValues(session, names);
+    const values = await this.passiveCollector.readCurrentValues(session, this.getPreferredPreviewNames(names));
     for (const [name, value] of values.entries()) {
       this.latestPreviewValues.set(name, value);
     }
     if (values.size > 0) {
-      this.scheduleSync(true);
+      this.scheduleTreeValueSync(true);
     }
   }
 
@@ -1153,12 +1172,47 @@ export class WaveformController implements vscode.Disposable {
     }, 16);
   }
 
+  private scheduleTreeValueSync(immediate = false): void {
+    const now = Date.now();
+    const minInterval = WaveformController.TREE_VALUE_SYNC_INTERVAL_MS;
+    if (immediate) {
+      if (now - this.lastTreeValueSyncAt >= minInterval) {
+        this.lastTreeValueSyncAt = now;
+        this.scheduleSync(true);
+        return;
+      }
+      if (this.treeValueSyncTimer) {
+        return;
+      }
+      const delay = Math.max(0, minInterval - (now - this.lastTreeValueSyncAt));
+      this.treeValueSyncTimer = setTimeout(() => {
+        this.treeValueSyncTimer = undefined;
+        this.lastTreeValueSyncAt = Date.now();
+        this.scheduleSync(true);
+      }, delay);
+      return;
+    }
+    if (this.treeValueSyncTimer) {
+      return;
+    }
+    const delay = Math.max(0, minInterval - (now - this.lastTreeValueSyncAt));
+    this.treeValueSyncTimer = setTimeout(() => {
+      this.treeValueSyncTimer = undefined;
+      this.lastTreeValueSyncAt = Date.now();
+      this.scheduleSync(true);
+    }, delay);
+  }
+
   private async pushState(): Promise<void> {
     const channels = this.dataBuffer.getChannels();
     const visibleChannels = this.getVisibleChannels(channels);
     const channelSignature = visibleChannels.map((c) => c.name).join('\u0001');
     const dataVersionChanged = this.dataBuffer.version !== this.lastPushedDataVersion;
     const structureChanged = channelSignature !== this.lastPushedChannelSignature;
+    this.liveWatchService.setPreviewSampleTargets(this.getPreferredPreviewNames(this.getAllLeafNodeNames()));
+    const treeStructureChanged = !this.cachedTreeRows || this.cachedTreeSig !== this.buildTreeStructureSignature();
+    const now = Date.now();
+    const shouldSyncTreeValues = now - this.lastTreeValueSyncAt >= WaveformController.TREE_VALUE_SYNC_INTERVAL_MS;
 
     // 记录当前 buffer 状态
     const latestValues = visibleChannels.map((c) => ({
@@ -1175,13 +1229,19 @@ export class WaveformController implements vscode.Disposable {
       this.viewProvider.hasView() &&
       dataVersionChanged &&
       !structureChanged &&
+      !treeStructureChanged &&
       this.dataBuffer.tsSize > 0;
 
     if (canAppend) {
       const append = this.buildAppendState(visibleChannels.map((c) => c.name));
       if (append && append.timestampsSec.length > 0) {
-        const viewState = this.buildViewState(channels, false);
-        this.viewProvider.postState(viewState);
+        if (shouldSyncTreeValues) {
+          const treeRows = this.buildTreeRows();
+          const viewState = this.buildViewState(channels, false, treeRows, false);
+          this.viewProvider.postState(viewState);
+          this.lastTreeValueSyncAt = now;
+          this.lastPushedTreeVersion = this.cachedTreeStructureVersion;
+        }
         this.viewProvider.postAppend(append);
         this.lastPushedDataVersion = this.dataBuffer.version;
         this.lastPushedChannelSignature = channelSignature;
@@ -1191,8 +1251,10 @@ export class WaveformController implements vscode.Disposable {
       }
     }
 
+    const treeRows = this.buildTreeRows();
+    this.lastTreeValueSyncAt = now;
     const includeData = dataVersionChanged || structureChanged;
-    const viewState = this.buildViewState(channels, includeData);
+    const viewState = this.buildViewState(channels, includeData, treeRows, true);
     this.viewProvider.postState(viewState);
 
     if (includeData) {
@@ -1200,15 +1262,19 @@ export class WaveformController implements vscode.Disposable {
       this.lastPushedChannelSignature = channelSignature;
       this.lastPushedTotalSamples = this.dataBuffer.totalSamples;
     }
+    this.lastPushedTreeVersion = this.cachedTreeStructureVersion;
   }
 
   private buildViewState(
     channels: ReturnType<DataBuffer['getChannels']>,
-    includeData: boolean
+    includeData: boolean,
+    treeRows?: TreeViewRow[],
+    includeTree = true
   ): WaveformViewState {
     const visibleChannels = this.getVisibleChannels(channels);
+    const channelsByName = new Map(channels.map((channel) => [channel.name, channel]));
     const variables = this.state.variableNames.map((name) => {
-      const ch = channels.find((c) => c.name === name);
+      const ch = channelsByName.get(name);
       const entry = this.liveWatchService.getResolvedEntries()[name];
       const valueText = this.getDisplayValueText(name, ch?.size ? ch.get(ch.size - 1) : undefined, entry?.dataType);
       return {
@@ -1219,8 +1285,8 @@ export class WaveformController implements vscode.Disposable {
       };
     });
     // 构建 tree rows（仅一次，避免 O(n^2) 双重计算）
-    const treeRows = this.buildTreeRows();
-    const leafRows = treeRows.filter(r => !r.hasChildren);
+    const effectiveTreeRows = treeRows ?? this.buildTreeRows();
+    const leafRows = effectiveTreeRows.filter(r => !r.hasChildren);
     const rowsWithValues = leafRows.filter(r => r.valueText);
     if (rowsWithValues.length > 0) {
       log(`buildViewState: ${leafRows.length} leaf rows, ${rowsWithValues.length} with values: ${rowsWithValues.slice(0, 5).map(r => `${r.name}=${r.valueText}`).join(', ')}`);
@@ -1237,7 +1303,8 @@ export class WaveformController implements vscode.Disposable {
       activeChannelCount: visibleChannels.length,
       variables,
       data: includeData ? this.buildFilteredSnapshot(visibleChannels) : undefined,
-      treeVariables: treeRows,
+      treeVariables: includeTree ? effectiveTreeRows : undefined,
+      treeValueUpdates: includeTree ? undefined : this.buildTreeValueUpdates(effectiveTreeRows),
       status: this.buildStatusText(),
       sessionStatus: this.currentDebugSession ? 'Debug session active' : 'No debug session',
       liveStatus: this.buildLiveStatusText(),
@@ -1346,6 +1413,50 @@ export class WaveformController implements vscode.Disposable {
   private getVisibleChannels(channels: ReturnType<DataBuffer['getChannels']>): ReturnType<DataBuffer['getChannels']> {
     const tracked = new Set(this.state.trackedVariables);
     return channels.filter((channel) => tracked.has(channel.name));
+  }
+
+  private buildTreeValueUpdates(rows: TreeViewRow[]): NonNullable<WaveformViewState['treeValueUpdates']> {
+    return rows.map((row) => ({
+      name: row.name,
+      valueText: row.valueText,
+      dataType: row.dataType,
+      address: row.address,
+      checkState: row.checkState,
+      color: row.color,
+      editable: row.editable
+    }));
+  }
+
+  private getPreferredPreviewNames(names: string[]): string[] {
+    const unique = [...new Set(names.map((name) => name.trim()).filter(Boolean))];
+    if (unique.length <= 64) {
+      return unique;
+    }
+
+    const expanded = new Set(this.state.expandedNodes);
+    const tracked = new Set(this.state.trackedVariables);
+    const preferred: string[] = [];
+    for (const name of unique) {
+      const parent = getParentPath(name);
+      if (!parent) {
+        if (tracked.has(name)) {
+          preferred.push(name);
+        }
+        continue;
+      }
+      if (tracked.has(name) || expanded.has(parent)) {
+        preferred.push(name);
+      }
+    }
+
+    if (preferred.length > 0) {
+      return preferred.slice(0, 128);
+    }
+    const trackedOnly = unique.filter((name) => tracked.has(name));
+    if (trackedOnly.length > 0) {
+      return trackedOnly.slice(0, 128);
+    }
+    return unique.slice(0, 64);
   }
 
   private buildFilteredSnapshot(channels: ReturnType<DataBuffer['getChannels']>): NonNullable<WaveformViewState['data']> {

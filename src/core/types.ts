@@ -34,6 +34,7 @@ export interface TreeViewRow {
   hasChildren: boolean;
   expanded: boolean;
   selectable: boolean;
+  editable: boolean;
   checkState: 'checked' | 'partial' | 'unchecked';
   color: string;
   isRoot: boolean;

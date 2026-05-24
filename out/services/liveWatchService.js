@@ -21,6 +21,8 @@ class LiveWatchService {
         /** 最近一次读取的所有变量值，用于树显示 */
         this.lastReadValues = new Map();
         this.sampleCount = 0;
+        this.previewSampleTargets = new Set();
+        this.lastNonPlotPreviewPushAt = 0;
         this.sampleRateMeter = new sampleRateMeter_1.SampleRateMeter();
         this.watchEntries = new Map();
         this.knownTreeNodes = new Set();
@@ -476,13 +478,21 @@ class LiveWatchService {
                         this.sampleCount += 1;
                         this.sampleRateMeter.mark(nowNs);
                         this.lastError = undefined;
+                        this.lastNonPlotPreviewPushAt = 0;
                         if (this.sampleCount <= 3) {
                             const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
                             console.log(`[waveform-plotter] sampleViaTcl #${this.sampleCount}: ${sampleStr}`);
                         }
                     }
+                    this.onData();
                 }
-                this.onData(); // 通知 controller 更新显示
+                else {
+                    const nowMs = Date.now();
+                    if (nowMs - this.lastNonPlotPreviewPushAt >= LiveWatchService.PREVIEW_PUSH_INTERVAL_MS) {
+                        this.lastNonPlotPreviewPushAt = nowMs;
+                        this.onData();
+                    }
+                }
             }
         }
         finally {
@@ -582,14 +592,20 @@ class LiveWatchService {
     getActualFrequencyHz() {
         return this.sampleRateMeter.getHz();
     }
+    setPreviewSampleTargets(names) {
+        this.previewSampleTargets = new Set(names.map((name) => name.trim()).filter(Boolean));
+    }
     getPreferredSampleEntries(entries = [...this.watchEntries.values()]) {
         const filtered = entries.filter((entry) => entry.address !== 0);
         if (!this.livePlotting) {
+            if (this.previewSampleTargets.size > 0) {
+                return filtered.filter((entry) => this.previewSampleTargets.has(entry.name));
+            }
             return filtered;
         }
         const activeChannels = this.dataBuffer.getChannels();
         if (activeChannels.length === 0) {
-            return filtered;
+            return [];
         }
         const activeNames = new Set(activeChannels.map((channel) => channel.name));
         return filtered.filter((entry) => activeNames.has(entry.name));
@@ -758,12 +774,20 @@ class LiveWatchService {
                     this.sampleCount += 1;
                     this.sampleRateMeter.mark(nowNs);
                     this.lastError = undefined;
+                    this.lastNonPlotPreviewPushAt = 0;
                     if (this.sampleCount <= 3) {
                         const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
                         console.log(`[waveform-plotter] sampleOnce #${this.sampleCount}: ${sampleStr}`);
                     }
+                    this.onData();
                 }
-                this.onData();
+                else {
+                    const nowMs = Date.now();
+                    if (nowMs - this.lastNonPlotPreviewPushAt >= LiveWatchService.PREVIEW_PUSH_INTERVAL_MS) {
+                        this.lastNonPlotPreviewPushAt = nowMs;
+                        this.onData();
+                    }
+                }
             }
             else {
                 console.warn(`[waveform-plotter] sampleOnce #${this.sampleCount}: no values read`);
@@ -1503,6 +1527,7 @@ class LiveWatchService {
     }
 }
 exports.LiveWatchService = LiveWatchService;
+LiveWatchService.PREVIEW_PUSH_INTERVAL_MS = 120;
 function sanitizeLiveTypeText(typeText) {
     const firstLine = typeText.split(/\r?\n/, 1)[0] ?? '';
     return firstLine.replace(/\s+/g, ' ').trim();

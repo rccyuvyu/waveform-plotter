@@ -2,11 +2,12 @@
   "name": "waveform-plotter-vscode",
   "displayName": "Waveform Plotter",
   "description": "Variable streaming plotter for embedded debug sessions: passive watch, live telnet, RTT and FFT.",
-  "version": "1.0.98",
+  "version": "1.1.4",
   "publisher": "rccyuvyu",
   "author": "rccyuvyu",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "UNLICENSED",
   "icon": "media/icon.png",
+  "markdown": "github",
   "keywords": [
     "embedded",
     "debug",
@@ -44,7 +45,7 @@
         {
           "id": "waveformPlotter",
           "title": "Waveform",
-          "icon": "media/waveform.svg"
+          "icon": "media/icon.png"
         }
       ]
     },

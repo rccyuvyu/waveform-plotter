@@ -22,6 +22,9 @@ export class LiveWatchService {
   lastReadValues = new Map<string, number>();
 
   sampleCount = 0;
+  private previewSampleTargets = new Set<string>();
+  private lastNonPlotPreviewPushAt = 0;
+  private static readonly PREVIEW_PUSH_INTERVAL_MS = 120;
   lastError: string | undefined;
   private readonly sampleRateMeter = new SampleRateMeter();
 
@@ -537,13 +540,20 @@ export class LiveWatchService {
             this.sampleCount += 1;
             this.sampleRateMeter.mark(nowNs);
             this.lastError = undefined;
+            this.lastNonPlotPreviewPushAt = 0;
             if (this.sampleCount <= 3) {
               const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
               console.log(`[waveform-plotter] sampleViaTcl #${this.sampleCount}: ${sampleStr}`);
             }
           }
+          this.onData();
+        } else {
+          const nowMs = Date.now();
+          if (nowMs - this.lastNonPlotPreviewPushAt >= LiveWatchService.PREVIEW_PUSH_INTERVAL_MS) {
+            this.lastNonPlotPreviewPushAt = nowMs;
+            this.onData();
+          }
         }
-        this.onData(); // 通知 controller 更新显示
       }
     } finally {
       this.sampleBusy = false;
@@ -651,15 +661,22 @@ export class LiveWatchService {
     return this.sampleRateMeter.getHz();
   }
 
+  setPreviewSampleTargets(names: string[]): void {
+    this.previewSampleTargets = new Set(names.map((name) => name.trim()).filter(Boolean));
+  }
+
   private getPreferredSampleEntries(entries = [...this.watchEntries.values()]): WatchEntry[] {
     const filtered = entries.filter((entry) => entry.address !== 0);
     if (!this.livePlotting) {
+      if (this.previewSampleTargets.size > 0) {
+        return filtered.filter((entry) => this.previewSampleTargets.has(entry.name));
+      }
       return filtered;
     }
 
     const activeChannels = this.dataBuffer.getChannels();
     if (activeChannels.length === 0) {
-      return filtered;
+      return [];
     }
 
     const activeNames = new Set(activeChannels.map((channel) => channel.name));
@@ -838,12 +855,19 @@ export class LiveWatchService {
           this.sampleCount += 1;
           this.sampleRateMeter.mark(nowNs);
           this.lastError = undefined;
+          this.lastNonPlotPreviewPushAt = 0;
           if (this.sampleCount <= 3) {
             const sampleStr = [...values.entries()].slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
             console.log(`[waveform-plotter] sampleOnce #${this.sampleCount}: ${sampleStr}`);
           }
+          this.onData();
+        } else {
+          const nowMs = Date.now();
+          if (nowMs - this.lastNonPlotPreviewPushAt >= LiveWatchService.PREVIEW_PUSH_INTERVAL_MS) {
+            this.lastNonPlotPreviewPushAt = nowMs;
+            this.onData();
+          }
         }
-        this.onData();
       } else {
         console.warn(`[waveform-plotter] sampleOnce #${this.sampleCount}: no values read`);
       }

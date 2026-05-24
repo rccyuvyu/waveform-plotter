@@ -62,6 +62,9 @@ class WaveformController {
         this.cachedTreeRows = null;
         /** 树结构签名，用于判断是否需要重建 cachedTreeRows */
         this.cachedTreeSig = '';
+        this.cachedTreeStructureVersion = 0;
+        this.lastPushedTreeVersion = -1;
+        this.lastTreeValueSyncAt = 0;
         this.dataBuffer = new dataBuffer_1.DataBuffer(vscode.workspace.getConfiguration('waveformPlotter').get('maxChannels', 8), vscode.workspace.getConfiguration('waveformPlotter').get('bufferSize', 10000));
         this.passiveCollector = new passiveCollector_1.PassiveCollector(this.dataBuffer);
         this.liveWatchService = new liveWatchService_1.LiveWatchService(this.dataBuffer, () => this.scheduleSync());
@@ -90,6 +93,10 @@ class WaveformController {
         if (this.syncTimer) {
             clearTimeout(this.syncTimer);
             this.syncTimer = undefined;
+        }
+        if (this.treeValueSyncTimer) {
+            clearTimeout(this.treeValueSyncTimer);
+            this.treeValueSyncTimer = undefined;
         }
         void this.liveWatchService.stopLiveWatch();
         void this.rttService.stopRtt();
@@ -818,9 +825,8 @@ class WaveformController {
             }
         }
     }
-    buildTreeRows() {
-        // 生成树结构签名，仅在结构/状态变化时重建
-        const treeSig = [
+    buildTreeStructureSignature() {
+        return [
             this.state.variableNames.join(','),
             this.state.expandedNodes.join(','),
             this.state.trackedVariables.join(','),
@@ -828,22 +834,27 @@ class WaveformController {
             this.liveWatchService.getKnownLeafNodes().join(','),
             Object.keys(this.liveWatchService.getResolvedEntries()).join(',')
         ].join('|');
+    }
+    buildTreeRows() {
+        // 生成树结构签名，仅在结构/状态变化时重建
+        const treeSig = this.buildTreeStructureSignature();
         if (this.cachedTreeRows && this.cachedTreeSig === treeSig) {
             // 结构未变，只需要更新值
             return this.updateCachedTreeValues();
         }
         this.cachedTreeSig = treeSig;
+        this.cachedTreeStructureVersion += 1;
         const resolved = this.liveWatchService.getResolvedEntries();
         const expandedSet = new Set(this.state.expandedNodes);
         const allNodes = new Set();
+        const relatedNodes = [
+            ...Object.keys(resolved),
+            ...this.liveWatchService.getKnownTreeNodes()
+        ];
         for (const name of this.state.variableNames) {
             for (const path of getAncestorPaths(name)) {
                 allNodes.add(path);
             }
-            const relatedNodes = [
-                ...Object.keys(resolved),
-                ...this.liveWatchService.getKnownTreeNodes()
-            ];
             for (const resolvedName of relatedNodes) {
                 if (resolvedName !== name && !isDescendantPath(resolvedName, name)) {
                     continue;
@@ -858,20 +869,22 @@ class WaveformController {
         const children = new Map();
         const hasChildren = new Set();
         for (const node of allNodes) {
-            const direct = [];
-            for (const other of allNodes) {
-                if (other !== node && getParentPath(other) === node) {
-                    direct.push(other);
-                }
+            const parent = getParentPath(node);
+            if (!parent) {
+                continue;
             }
-            if (direct.length > 0) {
-                direct.sort();
-                children.set(node, direct);
-                hasChildren.add(node);
-            }
+            const direct = children.get(parent) ?? [];
+            direct.push(node);
+            children.set(parent, direct);
+            hasChildren.add(parent);
+        }
+        for (const [parent, direct] of children.entries()) {
+            direct.sort(compareWatchPaths);
+            children.set(parent, direct);
         }
         const roots = [...allNodes].filter((n) => !getParentPath(n)).sort(compareWatchPaths);
         const rows = [];
+        const channelsByName = new Map(this.dataBuffer.getChannels().map((channel) => [channel.name, channel]));
         const walk = (names, depth) => {
             for (const name of names) {
                 const entry = resolved[name];
@@ -879,7 +892,7 @@ class WaveformController {
                 const declaredTypeText = entry?.declaredTypeText ?? this.liveWatchService.getKnownLeafDeclaredType(name);
                 const displayName = getDisplayName(name);
                 const nodeHasChildren = hasChildren.has(name);
-                const channel = this.dataBuffer.getChannels().find((c) => c.name === name);
+                const channel = channelsByName.get(name);
                 const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
                 const previewVal = this.liveWatchService.getLastReadValue(name);
                 const valueText = this.getDisplayValueText(name, latest ?? previewVal, entry?.dataType ?? hintedType)
@@ -894,6 +907,7 @@ class WaveformController {
                 else if (trackedCount > 0) {
                     checkState = 'partial';
                 }
+                const selectable = depth > 0 && isSelectableLeafNode(nodeHasChildren, declaredTypeText, entry?.dataType ?? hintedType);
                 rows.push({
                     name,
                     displayName,
@@ -903,7 +917,8 @@ class WaveformController {
                     address: entry ? `0x${entry.address.toString(16)}` : '',
                     hasChildren: nodeHasChildren,
                     expanded: expandedSet.has(name),
-                    selectable: depth > 0 && isSelectableLeafNode(nodeHasChildren, declaredTypeText, entry?.dataType ?? hintedType),
+                    selectable,
+                    editable: selectable && !!entry,
                     checkState,
                     color: channel?.color ?? '',
                     isRoot: depth === 0
@@ -922,10 +937,10 @@ class WaveformController {
         if (!this.cachedTreeRows)
             return [];
         const resolved = this.liveWatchService.getResolvedEntries();
-        const channels = this.dataBuffer.getChannels();
+        const channelsByName = new Map(this.dataBuffer.getChannels().map((channel) => [channel.name, channel]));
         for (const row of this.cachedTreeRows) {
             const entry = resolved[row.name];
-            const channel = channels.find((c) => c.name === row.name);
+            const channel = channelsByName.get(row.name);
             const latest = channel && channel.size > 0 ? channel.get(channel.size - 1) : undefined;
             const previewVal = this.liveWatchService.getLastReadValue(row.name);
             row.valueText = this.getDisplayValueText(row.name, latest ?? previewVal, entry?.dataType)
@@ -946,6 +961,7 @@ class WaveformController {
                 row.checkState = 'unchecked';
             }
             row.color = channel?.color ?? '';
+            row.editable = row.selectable && !!entry;
         }
         return this.cachedTreeRows;
     }
@@ -983,12 +999,12 @@ class WaveformController {
         return [...leafSet];
     }
     async refreshPreviewValues(session, names) {
-        const values = await this.passiveCollector.readCurrentValues(session, names);
+        const values = await this.passiveCollector.readCurrentValues(session, this.getPreferredPreviewNames(names));
         for (const [name, value] of values.entries()) {
             this.latestPreviewValues.set(name, value);
         }
         if (values.size > 0) {
-            this.scheduleSync(true);
+            this.scheduleTreeValueSync(true);
         }
     }
     async resolveTrackedVariables(session, variableNames) {
@@ -1076,12 +1092,46 @@ class WaveformController {
             void this.pushState();
         }, 16);
     }
+    scheduleTreeValueSync(immediate = false) {
+        const now = Date.now();
+        const minInterval = WaveformController.TREE_VALUE_SYNC_INTERVAL_MS;
+        if (immediate) {
+            if (now - this.lastTreeValueSyncAt >= minInterval) {
+                this.lastTreeValueSyncAt = now;
+                this.scheduleSync(true);
+                return;
+            }
+            if (this.treeValueSyncTimer) {
+                return;
+            }
+            const delay = Math.max(0, minInterval - (now - this.lastTreeValueSyncAt));
+            this.treeValueSyncTimer = setTimeout(() => {
+                this.treeValueSyncTimer = undefined;
+                this.lastTreeValueSyncAt = Date.now();
+                this.scheduleSync(true);
+            }, delay);
+            return;
+        }
+        if (this.treeValueSyncTimer) {
+            return;
+        }
+        const delay = Math.max(0, minInterval - (now - this.lastTreeValueSyncAt));
+        this.treeValueSyncTimer = setTimeout(() => {
+            this.treeValueSyncTimer = undefined;
+            this.lastTreeValueSyncAt = Date.now();
+            this.scheduleSync(true);
+        }, delay);
+    }
     async pushState() {
         const channels = this.dataBuffer.getChannels();
         const visibleChannels = this.getVisibleChannels(channels);
         const channelSignature = visibleChannels.map((c) => c.name).join('\u0001');
         const dataVersionChanged = this.dataBuffer.version !== this.lastPushedDataVersion;
         const structureChanged = channelSignature !== this.lastPushedChannelSignature;
+        this.liveWatchService.setPreviewSampleTargets(this.getPreferredPreviewNames(this.getAllLeafNodeNames()));
+        const treeStructureChanged = !this.cachedTreeRows || this.cachedTreeSig !== this.buildTreeStructureSignature();
+        const now = Date.now();
+        const shouldSyncTreeValues = now - this.lastTreeValueSyncAt >= WaveformController.TREE_VALUE_SYNC_INTERVAL_MS;
         // 记录当前 buffer 状态
         const latestValues = visibleChannels.map((c) => ({
             name: c.name,
@@ -1095,12 +1145,18 @@ class WaveformController {
         const canAppend = this.viewProvider.hasView() &&
             dataVersionChanged &&
             !structureChanged &&
+            !treeStructureChanged &&
             this.dataBuffer.tsSize > 0;
         if (canAppend) {
             const append = this.buildAppendState(visibleChannels.map((c) => c.name));
             if (append && append.timestampsSec.length > 0) {
-                const viewState = this.buildViewState(channels, false);
-                this.viewProvider.postState(viewState);
+                if (shouldSyncTreeValues) {
+                    const treeRows = this.buildTreeRows();
+                    const viewState = this.buildViewState(channels, false, treeRows, false);
+                    this.viewProvider.postState(viewState);
+                    this.lastTreeValueSyncAt = now;
+                    this.lastPushedTreeVersion = this.cachedTreeStructureVersion;
+                }
                 this.viewProvider.postAppend(append);
                 this.lastPushedDataVersion = this.dataBuffer.version;
                 this.lastPushedChannelSignature = channelSignature;
@@ -1109,19 +1165,23 @@ class WaveformController {
                 return;
             }
         }
+        const treeRows = this.buildTreeRows();
+        this.lastTreeValueSyncAt = now;
         const includeData = dataVersionChanged || structureChanged;
-        const viewState = this.buildViewState(channels, includeData);
+        const viewState = this.buildViewState(channels, includeData, treeRows, true);
         this.viewProvider.postState(viewState);
         if (includeData) {
             this.lastPushedDataVersion = this.dataBuffer.version;
             this.lastPushedChannelSignature = channelSignature;
             this.lastPushedTotalSamples = this.dataBuffer.totalSamples;
         }
+        this.lastPushedTreeVersion = this.cachedTreeStructureVersion;
     }
-    buildViewState(channels, includeData) {
+    buildViewState(channels, includeData, treeRows, includeTree = true) {
         const visibleChannels = this.getVisibleChannels(channels);
+        const channelsByName = new Map(channels.map((channel) => [channel.name, channel]));
         const variables = this.state.variableNames.map((name) => {
-            const ch = channels.find((c) => c.name === name);
+            const ch = channelsByName.get(name);
             const entry = this.liveWatchService.getResolvedEntries()[name];
             const valueText = this.getDisplayValueText(name, ch?.size ? ch.get(ch.size - 1) : undefined, entry?.dataType);
             return {
@@ -1132,8 +1192,8 @@ class WaveformController {
             };
         });
         // 构建 tree rows（仅一次，避免 O(n^2) 双重计算）
-        const treeRows = this.buildTreeRows();
-        const leafRows = treeRows.filter(r => !r.hasChildren);
+        const effectiveTreeRows = treeRows ?? this.buildTreeRows();
+        const leafRows = effectiveTreeRows.filter(r => !r.hasChildren);
         const rowsWithValues = leafRows.filter(r => r.valueText);
         if (rowsWithValues.length > 0) {
             (0, logger_1.log)(`buildViewState: ${leafRows.length} leaf rows, ${rowsWithValues.length} with values: ${rowsWithValues.slice(0, 5).map(r => `${r.name}=${r.valueText}`).join(', ')}`);
@@ -1148,7 +1208,8 @@ class WaveformController {
             activeChannelCount: visibleChannels.length,
             variables,
             data: includeData ? this.buildFilteredSnapshot(visibleChannels) : undefined,
-            treeVariables: treeRows,
+            treeVariables: includeTree ? effectiveTreeRows : undefined,
+            treeValueUpdates: includeTree ? undefined : this.buildTreeValueUpdates(effectiveTreeRows),
             status: this.buildStatusText(),
             sessionStatus: this.currentDebugSession ? 'Debug session active' : 'No debug session',
             liveStatus: this.buildLiveStatusText(),
@@ -1255,6 +1316,46 @@ class WaveformController {
         const tracked = new Set(this.state.trackedVariables);
         return channels.filter((channel) => tracked.has(channel.name));
     }
+    buildTreeValueUpdates(rows) {
+        return rows.map((row) => ({
+            name: row.name,
+            valueText: row.valueText,
+            dataType: row.dataType,
+            address: row.address,
+            checkState: row.checkState,
+            color: row.color,
+            editable: row.editable
+        }));
+    }
+    getPreferredPreviewNames(names) {
+        const unique = [...new Set(names.map((name) => name.trim()).filter(Boolean))];
+        if (unique.length <= 64) {
+            return unique;
+        }
+        const expanded = new Set(this.state.expandedNodes);
+        const tracked = new Set(this.state.trackedVariables);
+        const preferred = [];
+        for (const name of unique) {
+            const parent = getParentPath(name);
+            if (!parent) {
+                if (tracked.has(name)) {
+                    preferred.push(name);
+                }
+                continue;
+            }
+            if (tracked.has(name) || expanded.has(parent)) {
+                preferred.push(name);
+            }
+        }
+        if (preferred.length > 0) {
+            return preferred.slice(0, 128);
+        }
+        const trackedOnly = unique.filter((name) => tracked.has(name));
+        if (trackedOnly.length > 0) {
+            return trackedOnly.slice(0, 128);
+        }
+        return unique.slice(0, 64);
+    }
     buildFilteredSnapshot(channels) {
         const full = this.dataBuffer.snapshot();
         return {
@@ -1329,6 +1430,7 @@ class WaveformController {
     }
 }
 exports.WaveformController = WaveformController;
+WaveformController.TREE_VALUE_SYNC_INTERVAL_MS = 120;
 function csvField(s) {
     return /[,"]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }

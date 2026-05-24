@@ -142,6 +142,20 @@
     if (msg.state.treeVariables) {
       state.treeVariables = msg.state.treeVariables;
     }
+    if (msg.state.treeValueUpdates && state.treeVariables && state.treeVariables.length > 0) {
+      const updates = new Map(msg.state.treeValueUpdates.map(function (row) { return [row.name, row]; }));
+      for (let i = 0; i < state.treeVariables.length; i++) {
+        const current = state.treeVariables[i];
+        const patch = updates.get(current.name);
+        if (!patch) continue;
+        current.valueText = patch.valueText;
+        current.dataType = patch.dataType;
+        current.address = patch.address;
+        current.checkState = patch.checkState;
+        current.color = patch.color;
+        current.editable = patch.editable;
+      }
+    }
     renderControls();
     renderVariableTree();
   });
@@ -1014,7 +1028,7 @@
         if (!row.hasChildren) {
           var newVal = row.valueText || '';
           if (valTd.textContent !== newVal) { valTd.textContent = newVal; }
-          valTd.className = 'insp-value-cell editable';
+          valTd.className = row.editable === false ? 'insp-value-cell' : 'insp-value-cell editable';
         } else {
           valTd.textContent = '';
           valTd.className = 'insp-value-cell';
@@ -1078,9 +1092,9 @@
     tr.appendChild(nameTd);
 
     const valTd = document.createElement('td');
-    valTd.className = 'insp-value-cell' + (row.hasChildren ? '' : ' editable');
+    valTd.className = 'insp-value-cell' + (row.hasChildren || row.editable === false ? '' : ' editable');
     valTd.textContent = row.hasChildren ? '' : (row.valueText || '');
-    if (!row.hasChildren) {
+    if (!row.hasChildren && row.editable !== false) {
       valTd.addEventListener('dblclick', function () { startValueEdit(valTd, row); });
     }
     tr.appendChild(valTd);

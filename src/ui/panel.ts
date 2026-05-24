@@ -12,7 +12,8 @@ export interface WaveformViewState {
     valueText: string;
     color: string;
   }>;
-  treeVariables: TreeViewRow[];
+  treeVariables?: TreeViewRow[];
+  treeValueUpdates?: Array<Pick<TreeViewRow, 'name' | 'valueText' | 'dataType' | 'address' | 'checkState' | 'color' | 'editable'>>;
   data?: {
     channels: Array<{ name: string; color: string; data: number[] }>;
     timestampsSec: number[];
